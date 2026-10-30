@@ -77,11 +77,9 @@ struct FastMap {
     }
 };
 
-struct EpInfo {
-    std::string_view name;
-    uint32_t count = 0;
-    uint32_t errs = 0;
-    uint32_t offset = 0;
+struct Rec {
+    uint32_t gid;
+    uint32_t lat;
 };
 
 int main() {
@@ -138,11 +136,13 @@ int main() {
             const char* my_start = (w == 0) ? begin : global_first[h_start];
             const char* my_end = (w == W - 1) ? finish : global_last[h_end - 1];
 
-            std::vector<FastMap> maps(6);
-            std::vector<std::vector<EpInfo>> hour_eps(6);
-            uint32_t total_recs = 0;
+            FastMap map;
+            std::vector<std::string_view> ep_names; ep_names.reserve(45000);
+            std::vector<uint32_t> group_counts; group_counts.reserve(150000);
+            std::vector<uint32_t> group_errs; group_errs.reserve(150000);
+            std::vector<Rec> recs; recs.reserve(270000);
 
-            // Pass 1: count records per endpoint
+            // Single pass over my chunk of text
             const char* p = my_start;
             while (p < my_end) {
                 const char* line = p;
@@ -165,83 +165,55 @@ int main() {
 
                 while (q < nl && *q == ' ') ++q;
                 const bool is_5xx = (*q == '5');
-
-                auto& h_info = hour_eps[local_hid];
-                auto& map = maps[local_hid];
-                int32_t eid = map.get_or_insert(ep_sv, static_cast<uint32_t>(h_info.size()));
-                if (eid < 0) {
-                    eid = static_cast<int32_t>(h_info.size());
-                    h_info.push_back({ep_sv, 1, is_5xx ? 1u : 0u, 0});
-                } else {
-                    h_info[eid].count++;
-                    if (is_5xx) h_info[eid].errs++;
-                }
-                ++total_recs;
-            }
-
-            uint32_t cur_offset = 0;
-            for (size_t hi = 0; hi < 6; ++hi) {
-                for (auto& ep : hour_eps[hi]) {
-                    ep.offset = cur_offset;
-                    cur_offset += ep.count;
-                }
-            }
-
-            std::vector<uint32_t> latencies(total_recs);
-            std::vector<std::vector<uint32_t>> write_pos(6);
-            for (size_t hi = 0; hi < 6; ++hi) {
-                write_pos[hi].resize(hour_eps[hi].size());
-                for (size_t ei = 0; ei < hour_eps[hi].size(); ++ei) write_pos[hi][ei] = hour_eps[hi][ei].offset;
-            }
-
-            // Pass 2: store latencies
-            p = my_start;
-            while (p < my_end) {
-                const char* line = p;
-                const char* nl = static_cast<const char*>(std::memchr(line, '\n', static_cast<size_t>(my_end - line)));
-                if (!nl) nl = my_end; p = nl < my_end ? nl + 1 : my_end;
-                if (nl - line < 35) continue;
-
-                uint32_t hid = hour_to_idx(line);
-                if (hid < h_start || hid >= h_end) continue;
-                uint32_t local_hid = hid - h_start;
-
-                const char* q = line + 27;
-                if (*q != ' ') { while (q < nl && *q != ' ') ++q; }
-                while (q < nl && *q == ' ') ++q;
-                while (q < nl && *q != ' ') ++q;
-                while (q < nl && *q == ' ') ++q;
-                const char* es = q;
-                while (q < nl && *q != ' ') ++q;
-                std::string_view ep_sv(es, static_cast<size_t>(q - es));
-
-                while (q < nl && *q == ' ') ++q;
                 while (q < nl && *q != ' ') ++q;
                 while (q < nl && *q == ' ') ++q;
                 uint32_t lat = 0;
                 while (q < nl && *q >= '0' && *q <= '9') lat = lat * 10u + static_cast<uint32_t>(*q++ - '0');
 
-                int32_t eid = maps[local_hid].get_or_insert(ep_sv, 0);
-                latencies[write_pos[local_hid][eid]++] = lat;
+                int32_t eid = map.get_or_insert(ep_sv, static_cast<uint32_t>(ep_names.size()));
+                if (eid < 0) {
+                    eid = static_cast<int32_t>(ep_names.size());
+                    ep_names.push_back(ep_sv);
+                }
+                const uint32_t gid = local_hid * 65536u + static_cast<uint32_t>(eid);
+                if (gid >= group_counts.size()) {
+                    group_counts.resize(gid + 1, 0);
+                    group_errs.resize(gid + 1, 0);
+                }
+                group_counts[gid]++;
+                if (is_5xx) group_errs[gid]++;
+                recs.push_back({gid, lat});
             }
+
+            // Group offsets prefix sums
+            std::vector<uint32_t> group_offsets(group_counts.size() + 1, 0);
+            for (size_t g = 0; g < group_counts.size(); ++g) group_offsets[g + 1] = group_offsets[g] + group_counts[g];
+            std::vector<uint32_t> write_pos = group_offsets;
+            std::vector<uint32_t> latencies(group_offsets.back());
+
+            for (const auto& r : recs) latencies[write_pos[r.gid]++] = r.lat;
+            recs.clear(); recs.shrink_to_fit();
 
             // Output formatting
             std::string& out = worker_outputs[w];
             out.reserve(6 * 2048 * 64);
 
-            for (size_t hi = 0; hi < 6; ++hi) {
-                const char* hstr = HOUR_STRINGS[h_start + hi];
-                auto& eps = hour_eps[hi];
-                std::vector<uint32_t> order(eps.size());
-                for (size_t i = 0; i < eps.size(); ++i) order[i] = static_cast<uint32_t>(i);
-                std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-                    return eps[a].name < eps[b].name;
+            for (uint32_t local_hid = 0; local_hid < 6; ++local_hid) {
+                const char* hstr = HOUR_STRINGS[h_start + local_hid];
+                const uint32_t g_base = local_hid * 65536u;
+                std::vector<uint32_t> active_eids;
+                for (uint32_t eid = 0; eid < ep_names.size(); ++eid) {
+                    const uint32_t gid = g_base + eid;
+                    if (gid < group_counts.size() && group_counts[gid] > 0) active_eids.push_back(eid);
+                }
+                std::sort(active_eids.begin(), active_eids.end(), [&](uint32_t a, uint32_t b) {
+                    return ep_names[a] < ep_names[b];
                 });
 
-                for (uint32_t ei : order) {
-                    const auto& ep = eps[ei];
-                    const uint32_t count = ep.count;
-                    uint32_t* base = &latencies[ep.offset];
+                for (uint32_t eid : active_eids) {
+                    const uint32_t gid = g_base + eid;
+                    const uint32_t count = group_counts[gid];
+                    uint32_t* base = &latencies[group_offsets[gid]];
 
                     if (count > 1) {
                         if (count == 2) { if (base[1] < base[0]) std::swap(base[0], base[1]); }
@@ -256,13 +228,14 @@ int main() {
                         }
                     }
 
-                    out.append(hstr); out.append(":00:00Z "); out.append(ep.name); out.push_back(' ');
+                    out.append(hstr); out.append(":00:00Z "); out.append(ep_names[eid]); out.push_back(' ');
                     append_u64(out, count); out.push_back(' ');
                     append_u64(out, base[(50u * count + 99u) / 100u - 1u]); out.push_back(' ');
                     append_u64(out, base[(95u * count + 99u) / 100u - 1u]); out.push_back(' ');
                     append_u64(out, base[(99u * count + 99u) / 100u - 1u]); out.push_back(' ');
-                    append_u64(out, ep.errs); out.push_back(' ');
-                    append_u64(out, static_cast<uint64_t>(ep.errs) * 1000000ULL / count); out.push_back('\n');
+                    const uint32_t errs = group_errs[gid];
+                    append_u64(out, errs); out.push_back(' ');
+                    append_u64(out, static_cast<uint64_t>(errs) * 1000000ULL / count); out.push_back('\n');
                 }
             }
         });
