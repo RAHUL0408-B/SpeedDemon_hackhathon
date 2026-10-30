@@ -137,7 +137,7 @@ int main() {
     Mapping reg_file("/data/regions.csv");
     std::vector<std::string> countries;
     std::unordered_map<std::string, uint16_t> country_map;
-    std::vector<uint16_t> region_to_country(10'000'000, 0);
+    std::vector<uint16_t> region_to_country(1'000'001, 0);
 
     const char* rp   = reg_file.data;
     const char* rend = rp + reg_file.size;
