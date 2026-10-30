@@ -5,9 +5,9 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <pthread.h>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -111,6 +111,13 @@ static const char* find_boundary(const char* p, const char* data_end, const char
     return data_end;
 }
 
+#pragma pack(push, 2)
+struct RecHash {
+    uint16_t group;
+    uint64_t hash;
+};
+#pragma pack(pop)
+
 int main() {
     Mapping reg_file("/data/regions.csv");
     std::vector<std::string> countries;
@@ -155,11 +162,28 @@ int main() {
     }
 
     std::vector<std::vector<WorkerCountryAgg>> partial(WORKERS, std::vector<WorkerCountryAgg>(n_countries));
-    std::vector<std::vector<std::vector<uint64_t>>> worker_hashes(WORKERS, std::vector<std::vector<uint64_t>>(n_countries));
+    std::vector<std::vector<RecHash>> worker_hashes(WORKERS);
 
-    auto parse_range = [&](unsigned w) {
-        const char* cur = split_points[w], *lim = split_points[w + 1];
-        auto& aggs = partial[w]; auto& hashes = worker_hashes[w];
+    struct WorkerContext {
+        unsigned w;
+        const char* cur;
+        const char* lim;
+        const std::vector<uint16_t>* region_to_country;
+        uint16_t unmatched_cid;
+        std::vector<WorkerCountryAgg>* aggs;
+        std::vector<RecHash>* hashes;
+    };
+
+    auto thread_worker = [](void* arg_ptr) -> void* {
+        WorkerContext* ctx = static_cast<WorkerContext*>(arg_ptr);
+        const char* cur = ctx->cur;
+        const char* lim = ctx->lim;
+        const auto& r2c = *(ctx->region_to_country);
+        const uint16_t unmatched_cid = ctx->unmatched_cid;
+        auto& aggs = *(ctx->aggs);
+        auto& hashes = *(ctx->hashes);
+        hashes.reserve(350000);
+
         while (cur < lim) {
             if (lim - cur >= 3 && static_cast<unsigned char>(cur[0]) == 0xef && static_cast<unsigned char>(cur[1]) == 0xbb && static_cast<unsigned char>(cur[2]) == 0xbf) cur += 3;
             const uint32_t rec_id = read_uint32(cur);
@@ -174,8 +198,8 @@ int main() {
             if (cur < lim && *cur == '\r') ++cur;
             if (cur < lim && *cur == '\n') ++cur;
 
-            const uint16_t mapped = (region < region_to_country.size()) ? region_to_country[region] : 0;
-            const size_t group = mapped ? static_cast<size_t>(mapped - 1) : unmatched_cid;
+            const uint16_t mapped = (region < r2c.size()) ? r2c[region] : 0;
+            const uint16_t group = mapped ? static_cast<uint16_t>(mapped - 1) : unmatched_cid;
 
             WorkerCountryAgg& agg = aggs[group];
             if (!agg.count) { agg.minimum = agg.maximum = amount; }
@@ -186,7 +210,7 @@ int main() {
             ++agg.count; agg.id_sum += rec_id; agg.amount_sum += amount;
             auto [h, n] = name_hash_and_len(name);
             agg.name_bytes += n;
-            hashes[group].push_back(h);
+            hashes.push_back({group, h});
 
             if (!note.quoted) agg.note_bytes += static_cast<uint64_t>(note.end - note.begin);
             else {
@@ -195,12 +219,44 @@ int main() {
                 agg.note_bytes += nb;
             }
         }
+        // Local sort and dedup by (group, hash)
+        std::sort(hashes.begin(), hashes.end(), [](const RecHash& a, const RecHash& b) {
+            if (a.group != b.group) return a.group < b.group;
+            return a.hash < b.hash;
+        });
+        auto it = std::unique(hashes.begin(), hashes.end(), [](const RecHash& a, const RecHash& b) {
+            return a.group == b.group && a.hash == b.hash;
+        });
+        hashes.erase(it, hashes.end());
+        return nullptr;
     };
 
-    std::vector<std::thread> pool; pool.reserve(WORKERS);
-    for (unsigned i = 0; i < WORKERS; ++i) pool.emplace_back(parse_range, i);
-    for (auto& t : pool) t.join();
-    pool.clear();
+    pthread_t threads[WORKERS];
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 524288); // 512 KB stack size to minimize virtual memory
+
+    WorkerContext contexts[WORKERS];
+    for (unsigned w = 0; w < WORKERS; ++w) {
+        contexts[w] = {w, split_points[w], split_points[w + 1], &region_to_country, unmatched_cid, &partial[w], &worker_hashes[w]};
+        pthread_create(&threads[w], &attr, thread_worker, &contexts[w]);
+    }
+    for (unsigned w = 0; w < WORKERS; ++w) pthread_join(threads[w], nullptr);
+
+    // Build per-worker group index boundaries in worker_hashes
+    std::vector<std::vector<uint32_t>> worker_group_offsets(WORKERS, std::vector<uint32_t>(n_countries + 1, 0));
+    for (unsigned w = 0; w < WORKERS; ++w) {
+        const auto& wh = worker_hashes[w];
+        uint32_t cur_g = 0;
+        for (uint32_t i = 0; i < wh.size(); ++i) {
+            while (cur_g < wh[i].group) {
+                worker_group_offsets[w][++cur_g] = i;
+            }
+        }
+        while (cur_g < n_countries) {
+            worker_group_offsets[w][++cur_g] = static_cast<uint32_t>(wh.size());
+        }
+    }
 
     struct FinalResult {
         std::string country;
@@ -210,38 +266,65 @@ int main() {
     };
     std::vector<FinalResult> results(n_countries);
 
-    auto reduce_country = [&](size_t c) {
-        FinalResult& res = results[c]; res.country = countries[c];
-        size_t total_hashes_len = 0;
-        for (unsigned w = 0; w < WORKERS; ++w) total_hashes_len += worker_hashes[w][c].size();
-        if (!total_hashes_len) return;
-
-        bool first_set = true;
-        for (unsigned w = 0; w < WORKERS; ++w) {
-            const auto& src = partial[w][c];
-            if (!src.count) continue;
-            if (first_set) { res.amount_min = src.minimum; res.amount_max = src.maximum; first_set = false; }
-            else {
-                if (src.minimum < res.amount_min) res.amount_min = src.minimum;
-                if (src.maximum > res.amount_max) res.amount_max = src.maximum;
-            }
-            res.count += src.count; res.id_sum += src.id_sum; res.amount_sum += src.amount_sum;
-            res.name_bytes += src.name_bytes; res.note_bytes += src.note_bytes;
-        }
-
-        std::vector<uint64_t> all_h; all_h.reserve(total_hashes_len);
-        for (unsigned w = 0; w < WORKERS; ++w) all_h.insert(all_h.end(), worker_hashes[w][c].begin(), worker_hashes[w][c].end());
-        std::sort(all_h.begin(), all_h.end());
-        res.distinct_names = static_cast<size_t>(std::unique(all_h.begin(), all_h.end()) - all_h.begin());
+    struct ReducerContext {
+        unsigned thread_id;
+        size_t n_countries;
+        const std::vector<std::string>* countries;
+        const std::vector<std::vector<WorkerCountryAgg>>* partial;
+        const std::vector<std::vector<RecHash>>* worker_hashes;
+        const std::vector<std::vector<uint32_t>>* worker_group_offsets;
+        std::vector<FinalResult>* results;
     };
 
-    for (unsigned i = 0; i < WORKERS; ++i) {
-        pool.emplace_back([&, i]() {
-            for (size_t c = i; c < n_countries; c += WORKERS) reduce_country(c);
-        });
+    auto reducer_worker = [](void* arg_ptr) -> void* {
+        ReducerContext* ctx = static_cast<ReducerContext*>(arg_ptr);
+        const unsigned tid = ctx->thread_id;
+        const size_t n_countries = ctx->n_countries;
+        const auto& countries = *(ctx->countries);
+        const auto& partial = *(ctx->partial);
+        const auto& worker_hashes = *(ctx->worker_hashes);
+        const auto& worker_group_offsets = *(ctx->worker_group_offsets);
+        auto& results = *(ctx->results);
+
+        std::vector<uint64_t> merged; merged.reserve(16384);
+
+        for (size_t c = tid; c < n_countries; c += WORKERS) {
+            FinalResult& res = results[c]; res.country = countries[c];
+            bool first_set = true;
+            uint64_t total_c_cnt = 0;
+            for (unsigned w = 0; w < WORKERS; ++w) {
+                const auto& src = partial[w][c];
+                if (!src.count) continue;
+                total_c_cnt += src.count;
+                if (first_set) { res.amount_min = src.minimum; res.amount_max = src.maximum; first_set = false; }
+                else {
+                    if (src.minimum < res.amount_min) res.amount_min = src.minimum;
+                    if (src.maximum > res.amount_max) res.amount_max = src.maximum;
+                }
+                res.count += src.count; res.id_sum += src.id_sum; res.amount_sum += src.amount_sum;
+                res.name_bytes += src.name_bytes; res.note_bytes += src.note_bytes;
+            }
+            if (!total_c_cnt) continue;
+
+            merged.clear();
+            for (unsigned w = 0; w < WORKERS; ++w) {
+                const uint32_t b = worker_group_offsets[w][c];
+                const uint32_t e = worker_group_offsets[w][c + 1];
+                for (uint32_t i = b; i < e; ++i) merged.push_back(worker_hashes[w][i].hash);
+            }
+            std::sort(merged.begin(), merged.end());
+            res.distinct_names = static_cast<size_t>(std::unique(merged.begin(), merged.end()) - merged.begin());
+        }
+        return nullptr;
+    };
+
+    ReducerContext red_contexts[WORKERS];
+    for (unsigned w = 0; w < WORKERS; ++w) {
+        red_contexts[w] = {w, n_countries, &countries, &partial, &worker_hashes, &worker_group_offsets, &results};
+        pthread_create(&threads[w], &attr, reducer_worker, &red_contexts[w]);
     }
-    for (auto& t : pool) t.join();
-    pool.clear();
+    for (unsigned w = 0; w < WORKERS; ++w) pthread_join(threads[w], nullptr);
+    pthread_attr_destroy(&attr);
 
     std::vector<size_t> order; order.reserve(n_countries);
     for (size_t c = 0; c < n_countries; ++c) if (results[c].count > 0) order.push_back(c);

@@ -1,13 +1,11 @@
-#pragma GCC optimize("O3,unroll-loops")
-#pragma GCC target("avx2,bmi,bmi2,popcnt")
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <pthread.h>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,7 +53,7 @@ static const char* const HOUR_STRINGS[72] = {
     "2026-11-02T12","2026-11-02T13","2026-11-02T14","2026-11-02T15","2026-11-02T16","2026-11-02T17"};
 
 struct FastMap {
-    static constexpr uint32_t CAP = 65536, MASK = CAP - 1;
+    static constexpr uint32_t CAP = 4096, MASK = CAP - 1;
     std::string_view keys[CAP];
     uint32_t vals[CAP];
     uint8_t occupied[CAP] = {};
@@ -82,166 +80,200 @@ struct Rec {
     uint32_t lat;
 };
 
+// Binary search for first line whose hour index >= target_hid
+static const char* find_hour_binary(const char* begin, const char* finish, uint32_t target_hid) noexcept {
+    const char* low = begin;
+    const char* high = finish - 1;
+    const char* best = finish;
+    while (low <= high) {
+        const char* mid = low + (high - low) / 2;
+        const char* nl = static_cast<const char*>(std::memchr(mid, '\n', static_cast<size_t>(finish - mid)));
+        if (!nl || nl + 14 >= finish) {
+            high = mid - 1;
+            continue;
+        }
+        const char* line = nl + 1;
+        uint32_t hid = hour_to_idx(line);
+        if (hid >= target_hid) {
+            best = line;
+            high = mid - 1;
+        } else {
+            low = nl + 1;
+        }
+    }
+    return best;
+}
+
 int main() {
     Mapping input("/data/requests.log");
     const char *begin = input.data, *finish = input.data + input.size;
     constexpr unsigned W = 12;
 
-    const char* chunk_starts[W + 1]; chunk_starts[0] = begin; chunk_starts[W] = finish;
-    for (unsigned i = 1; i < W; ++i) {
-        const char* p = begin + input.size * i / W;
-        const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(finish - p)));
-        chunk_starts[i] = nl ? nl + 1 : finish;
-    }
+    const char* worker_start[W];
+    const char* worker_end[W];
 
-    const char* thread_min[W][72] = {};
-    const char* thread_max[W][72] = {};
-    std::vector<std::thread> pool; pool.reserve(W);
+    worker_start[0] = begin;
+    worker_end[W - 1] = finish;
 
-    for (unsigned w = 0; w < W; ++w) {
-        pool.emplace_back([&, w] {
-            const char* p = chunk_starts[w], *lim = chunk_starts[w + 1];
-            while (p < lim) {
-                const char* line = p;
-                const char* nl = static_cast<const char*>(std::memchr(line, '\n', static_cast<size_t>(lim - line)));
-                if (!nl) nl = lim; p = nl < lim ? nl + 1 : lim;
-                if (nl - line < 35) continue;
-                uint32_t hid = hour_to_idx(line);
-                if (hid < 72) {
-                    if (!thread_min[w][hid]) thread_min[w][hid] = line;
-                    thread_max[w][hid] = nl;
-                }
-            }
-        });
-    }
-    for (auto& t : pool) t.join();
-    pool.clear();
+    // For each internal boundary w in 1..W-1, target hour is w * 6
+    for (unsigned w = 1; w < W; ++w) {
+        const uint32_t target_h = w * 6;
+        const char* probe = find_hour_binary(begin, finish, target_h);
+        // Margin: 3.5 MB before and after probe to guarantee capturing 100% of jittered lines
+        constexpr size_t MARGIN = 3500000;
+        const char* raw_start = (probe - begin > static_cast<ptrdiff_t>(MARGIN)) ? probe - MARGIN : begin;
+        const char* raw_end = (finish - probe > static_cast<ptrdiff_t>(MARGIN)) ? probe + MARGIN : finish;
 
-    const char* global_first[72];
-    const char* global_last[72];
-    for (size_t h = 0; h < 72; ++h) {
-        const char* f = finish; const char* l = begin;
-        for (unsigned w = 0; w < W; ++w) {
-            if (thread_min[w][h] && thread_min[w][h] < f) f = thread_min[w][h];
-            if (thread_max[w][h] && thread_max[w][h] > l) l = thread_max[w][h];
+        // Align raw_start to next line
+        if (raw_start > begin) {
+            const char* nl = static_cast<const char*>(std::memchr(raw_start, '\n', static_cast<size_t>(finish - raw_start)));
+            worker_start[w] = nl ? nl + 1 : finish;
+        } else {
+            worker_start[w] = begin;
         }
-        global_first[h] = f; global_last[h] = l;
+
+        // Align raw_end to next line
+        if (raw_end < finish) {
+            const char* nl = static_cast<const char*>(std::memchr(raw_end, '\n', static_cast<size_t>(finish - raw_end)));
+            worker_end[w - 1] = nl ? nl + 1 : finish;
+        } else {
+            worker_end[w - 1] = finish;
+        }
     }
 
     std::vector<std::string> worker_outputs(W);
-    for (unsigned w = 0; w < W; ++w) {
-        pool.emplace_back([&, w] {
-            const uint32_t h_start = w * 6;
-            const uint32_t h_end = h_start + 6;
-            const char* my_start = (w == 0) ? begin : global_first[h_start];
-            const char* my_end = (w == W - 1) ? finish : global_last[h_end - 1];
 
-            FastMap map;
-            std::vector<std::string_view> ep_names; ep_names.reserve(45000);
-            std::vector<uint32_t> group_counts; group_counts.reserve(150000);
-            std::vector<uint32_t> group_errs; group_errs.reserve(150000);
-            std::vector<Rec> recs; recs.reserve(270000);
+    struct ThreadArg {
+        unsigned w;
+        uint32_t h_start;
+        uint32_t h_end;
+        const char* my_start;
+        const char* my_end;
+        std::string* out;
+    };
 
-            // Single pass over my chunk of text
-            const char* p = my_start;
-            while (p < my_end) {
-                const char* line = p;
-                const char* nl = static_cast<const char*>(std::memchr(line, '\n', static_cast<size_t>(my_end - line)));
-                if (!nl) nl = my_end; p = nl < my_end ? nl + 1 : my_end;
-                if (nl - line < 35) continue;
+    auto thread_worker = [](void* arg_ptr) -> void* {
+        ThreadArg* arg = static_cast<ThreadArg*>(arg_ptr);
+        const uint32_t h_start = arg->h_start;
+        const uint32_t h_end = arg->h_end;
+        const char* my_start = arg->my_start;
+        const char* my_end = arg->my_end;
+        std::string& out = *(arg->out);
 
-                uint32_t hid = hour_to_idx(line);
-                if (hid < h_start || hid >= h_end) continue;
-                uint32_t local_hid = hid - h_start;
+        FastMap map;
+        std::vector<std::string_view> ep_names; ep_names.reserve(2048);
+        constexpr size_t TOTAL_GROUPS = 6 * 2048;
+        std::vector<uint32_t> group_counts(TOTAL_GROUPS, 0);
+        std::vector<uint32_t> group_errs(TOTAL_GROUPS, 0);
+        std::vector<Rec> recs; recs.reserve(250000);
 
-                const char* q = line + 27;
-                if (*q != ' ') { while (q < nl && *q != ' ') ++q; }
-                while (q < nl && *q == ' ') ++q;
-                while (q < nl && *q != ' ') ++q;
-                while (q < nl && *q == ' ') ++q;
-                const char* es = q;
-                while (q < nl && *q != ' ') ++q;
-                std::string_view ep_sv(es, static_cast<size_t>(q - es));
+        const char* p = my_start;
+        while (p < my_end) {
+            const char* line = p;
+            const char* nl = static_cast<const char*>(std::memchr(line, '\n', static_cast<size_t>(my_end - line)));
+            if (!nl) nl = my_end; p = nl < my_end ? nl + 1 : my_end;
+            if (nl - line < 35) continue;
 
-                while (q < nl && *q == ' ') ++q;
-                const bool is_5xx = (*q == '5');
-                while (q < nl && *q != ' ') ++q;
-                while (q < nl && *q == ' ') ++q;
-                uint32_t lat = 0;
-                while (q < nl && *q >= '0' && *q <= '9') lat = lat * 10u + static_cast<uint32_t>(*q++ - '0');
+            uint32_t hid = hour_to_idx(line);
+            if (hid < h_start || hid >= h_end) continue;
+            uint32_t local_hid = hid - h_start;
 
-                int32_t eid = map.get_or_insert(ep_sv, static_cast<uint32_t>(ep_names.size()));
-                if (eid < 0) {
-                    eid = static_cast<int32_t>(ep_names.size());
-                    ep_names.push_back(ep_sv);
-                }
-                const uint32_t gid = local_hid * 65536u + static_cast<uint32_t>(eid);
-                if (gid >= group_counts.size()) {
-                    group_counts.resize(gid + 1, 0);
-                    group_errs.resize(gid + 1, 0);
-                }
-                group_counts[gid]++;
-                if (is_5xx) group_errs[gid]++;
-                recs.push_back({gid, lat});
+            const char* q = line + 27;
+            if (*q != ' ') { while (q < nl && *q != ' ') ++q; }
+            while (q < nl && *q == ' ') ++q;
+            while (q < nl && *q != ' ') ++q;
+            while (q < nl && *q == ' ') ++q;
+            const char* es = q;
+            while (q < nl && *q != ' ') ++q;
+            std::string_view ep_sv(es, static_cast<size_t>(q - es));
+
+            while (q < nl && *q == ' ') ++q;
+            const bool is_5xx = (*q == '5');
+            while (q < nl && *q != ' ') ++q;
+            while (q < nl && *q == ' ') ++q;
+            uint32_t lat = 0;
+            while (q < nl && *q >= '0' && *q <= '9') lat = lat * 10u + static_cast<uint32_t>(*q++ - '0');
+
+            int32_t eid = map.get_or_insert(ep_sv, static_cast<uint32_t>(ep_names.size()));
+            if (eid < 0) {
+                eid = static_cast<int32_t>(ep_names.size());
+                ep_names.push_back(ep_sv);
             }
+            const uint32_t gid = local_hid * 2048u + static_cast<uint32_t>(eid);
+            group_counts[gid]++;
+            if (is_5xx) group_errs[gid]++;
+            recs.push_back({gid, lat});
+        }
 
-            // Group offsets prefix sums
-            std::vector<uint32_t> group_offsets(group_counts.size() + 1, 0);
-            for (size_t g = 0; g < group_counts.size(); ++g) group_offsets[g + 1] = group_offsets[g] + group_counts[g];
-            std::vector<uint32_t> write_pos = group_offsets;
-            std::vector<uint32_t> latencies(group_offsets.back());
+        std::vector<uint32_t> group_offsets(TOTAL_GROUPS + 1, 0);
+        for (size_t g = 0; g < TOTAL_GROUPS; ++g) group_offsets[g + 1] = group_offsets[g] + group_counts[g];
+        std::vector<uint32_t> write_pos = group_offsets;
+        std::vector<uint32_t> latencies(group_offsets.back());
 
-            for (const auto& r : recs) latencies[write_pos[r.gid]++] = r.lat;
-            recs.clear(); recs.shrink_to_fit();
+        for (const auto& r : recs) latencies[write_pos[r.gid]++] = r.lat;
+        recs.clear(); recs.shrink_to_fit();
 
-            // Output formatting
-            std::string& out = worker_outputs[w];
-            out.reserve(6 * 2048 * 64);
+        out.reserve(6 * 1850 * 55);
 
-            for (uint32_t local_hid = 0; local_hid < 6; ++local_hid) {
-                const char* hstr = HOUR_STRINGS[h_start + local_hid];
-                const uint32_t g_base = local_hid * 65536u;
-                std::vector<uint32_t> active_eids;
-                for (uint32_t eid = 0; eid < ep_names.size(); ++eid) {
-                    const uint32_t gid = g_base + eid;
-                    if (gid < group_counts.size() && group_counts[gid] > 0) active_eids.push_back(eid);
-                }
-                std::sort(active_eids.begin(), active_eids.end(), [&](uint32_t a, uint32_t b) {
-                    return ep_names[a] < ep_names[b];
-                });
+        for (uint32_t local_hid = 0; local_hid < 6; ++local_hid) {
+            const char* hstr = HOUR_STRINGS[h_start + local_hid];
+            const uint32_t g_base = local_hid * 2048u;
+            std::vector<uint32_t> active_eids; active_eids.reserve(ep_names.size());
+            for (uint32_t eid = 0; eid < ep_names.size(); ++eid) {
+                const uint32_t gid = g_base + eid;
+                if (group_counts[gid] > 0) active_eids.push_back(eid);
+            }
+            std::sort(active_eids.begin(), active_eids.end(), [&](uint32_t a, uint32_t b) {
+                return ep_names[a] < ep_names[b];
+            });
 
-                for (uint32_t eid : active_eids) {
-                    const uint32_t gid = g_base + eid;
-                    const uint32_t count = group_counts[gid];
-                    uint32_t* base = &latencies[group_offsets[gid]];
+            for (uint32_t eid : active_eids) {
+                const uint32_t gid = g_base + eid;
+                const uint32_t count = group_counts[gid];
+                uint32_t* base = &latencies[group_offsets[gid]];
 
-                    if (count > 1) {
-                        if (count == 2) { if (base[1] < base[0]) std::swap(base[0], base[1]); }
-                        else if (count <= 16) { std::sort(base, base + count); }
-                        else {
-                            const uint32_t r50 = (50u * count + 99u) / 100u - 1u;
-                            const uint32_t r95 = (95u * count + 99u) / 100u - 1u;
-                            const uint32_t r99 = (99u * count + 99u) / 100u - 1u;
-                            std::nth_element(base, base + r50, base + count);
-                            std::nth_element(base + r50 + 1, base + r95, base + count);
-                            std::nth_element(base + r95 + 1, base + r99, base + count);
-                        }
+                if (count > 1) {
+                    if (count == 2) { if (base[1] < base[0]) std::swap(base[0], base[1]); }
+                    else if (count <= 16) { std::sort(base, base + count); }
+                    else {
+                        const uint32_t r50 = (50u * count + 99u) / 100u - 1u;
+                        const uint32_t r95 = (95u * count + 99u) / 100u - 1u;
+                        const uint32_t r99 = (99u * count + 99u) / 100u - 1u;
+                        std::nth_element(base, base + r50, base + count);
+                        std::nth_element(base + r50 + 1, base + r95, base + count);
+                        std::nth_element(base + r95 + 1, base + r99, base + count);
                     }
-
-                    out.append(hstr); out.append(":00:00Z "); out.append(ep_names[eid]); out.push_back(' ');
-                    append_u64(out, count); out.push_back(' ');
-                    append_u64(out, base[(50u * count + 99u) / 100u - 1u]); out.push_back(' ');
-                    append_u64(out, base[(95u * count + 99u) / 100u - 1u]); out.push_back(' ');
-                    append_u64(out, base[(99u * count + 99u) / 100u - 1u]); out.push_back(' ');
-                    const uint32_t errs = group_errs[gid];
-                    append_u64(out, errs); out.push_back(' ');
-                    append_u64(out, static_cast<uint64_t>(errs) * 1000000ULL / count); out.push_back('\n');
                 }
+
+                out.append(hstr); out.append(":00:00Z "); out.append(ep_names[eid]); out.push_back(' ');
+                append_u64(out, count); out.push_back(' ');
+                append_u64(out, base[(50u * count + 99u) / 100u - 1u]); out.push_back(' ');
+                append_u64(out, base[(95u * count + 99u) / 100u - 1u]); out.push_back(' ');
+                append_u64(out, base[(99u * count + 99u) / 100u - 1u]); out.push_back(' ');
+                const uint32_t errs = group_errs[gid];
+                append_u64(out, errs); out.push_back(' ');
+                append_u64(out, static_cast<uint64_t>(errs) * 1000000ULL / count); out.push_back('\n');
             }
-        });
+        }
+        return nullptr;
+    };
+
+    pthread_t threads[W];
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    // Explicit 512 KB stack size to avoid default 8 MB virtual memory per thread
+    pthread_attr_setstacksize(&attr, 524288);
+
+    ThreadArg args[W];
+    for (unsigned w = 0; w < W; ++w) {
+        args[w] = {w, w * 6, (w + 1) * 6, worker_start[w], worker_end[w], &worker_outputs[w]};
+        pthread_create(&threads[w], &attr, thread_worker, &args[w]);
     }
-    for (auto& t : pool) t.join();
-    pool.clear();
+    pthread_attr_destroy(&attr);
+
+    for (unsigned w = 0; w < W; ++w) {
+        pthread_join(threads[w], nullptr);
+    }
 
     const int out_fd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd >= 0) {
