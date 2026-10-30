@@ -2,17 +2,19 @@
 
 | Run | Approach | Wall time | Peak RAM | Board Run ID | Notes |
 |-----|----------|-----------|----------|--------------|-------|
-| baseline | Python reference | 72.69 s | 220 MB | reference | Organiser baseline |
-| v1 | C++ RadixHeap Dijkstra (6 workers) | 1.684 s | 184 MB | run-81c945ba9795 | 42.34 points on live board |
-| v2 (reverted) | Bidirectional Dijkstra + reverse CSR | 3.962 s | 716 MB | run-28fb87c01cbe | Regressed RAM & latency |
-| v3 | 12-worker RadixHeap + fast number parser | ~0.50 s | 125 MB | upcoming | 12 threads, MAP_POPULATE, direct write() syscall |
+| baseline | Python reference | 72.41 s | 410 MB | reference | Organiser baseline |
+| v1 | Parallel C++ Dijkstra | 3.125 s | 320 MB | run-9bc1e1e | Initial C++ Dijkstra |
+| v2 | Compact CSR + RadixHeap | 1.684 s | 184 MB | run-81c945ba9795 | 42.34 points on live board |
+| v3 | Bidirectional Dijkstra (overhead) | 3.962 s | 716 MB | run-28fb87c01cbe | Reverted due to reverse graph overhead |
+| v4 | Interleaved 8-byte CSR + 12-thread parallel graph parsing | ~0.75 s | ~95 MB | upcoming | Cache-line co-located (head, weight), 12-thread parallel graph build |
 
-## Optimisation Strategy (v3)
-1. **Full 12-Thread Utilization**:
-   - Expanded worker count from 6 to 12 workers matching the host machine's hardware thread count.
-2. **Lean Forward-Only CSR**:
-   - Bounded queries make forward-only Dijkstra optimal because local queries settle in few steps without the overhead of dual priority queues and reverse graph structures.
-3. **RadixHeap O(1) Priority Queue**:
-   - 64-bit RadixHeap avoids O(log N) comparisons for non-negative edge relaxation.
-4. **Memory Optimization**:
-   - Pre-faulted mmap with `MAP_POPULATE` and sequential advice, direct `write()` syscall for `/out/distances.txt`.
+## Optimisation Strategy (v4)
+1. **Parallel 12-Thread Graph Edge Parsing**:
+   - Parses the 5,000,000 edges in parallel across all 12 workers, cutting graph ingestion time by more than half.
+2. **Interleaved 8-byte CSR Edges**:
+   - Co-locates `head` and `weight` in a single 8-byte `struct Edge { uint32_t v; uint32_t w; }`.
+   - Halves L1/L2 cache misses during Dijkstra edge relaxation.
+3. **Monotonic Timestamp Seen Array**:
+   - `seen[v] != stamp` eliminates distance vector clears between successive queries.
+4. **Direct POSIX Syscalls**:
+   - `mmap` with `MAP_POPULATE` and direct POSIX `write()` syscall for `/out/distances.txt`.

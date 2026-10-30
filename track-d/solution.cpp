@@ -6,6 +6,7 @@
 #include <atomic>
 #include <charconv>
 #include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <string>
@@ -14,7 +15,6 @@
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 struct Mapping {
@@ -33,17 +33,14 @@ struct Mapping {
     ~Mapping() { if (data && data != MAP_FAILED) munmap(const_cast<char*>(data), size); if (fd >= 0) close(fd); }
 };
 
-struct Reader {
-    const char* p; const char* end;
-    inline uint32_t number() noexcept {
-        while (p < end && static_cast<unsigned char>(*p) <= ' ') ++p;
-        uint32_t n = 0;
-        while (p < end && *p >= '0' && *p <= '9') {
-            n = n * 10u + static_cast<uint32_t>(*p++ - '0');
-        }
-        return n;
+static inline uint32_t fast_parse_uint(const char*& p, const char* end) noexcept {
+    while (p < end && static_cast<unsigned char>(*p) <= ' ') ++p;
+    uint32_t n = 0;
+    while (p < end && *p >= '0' && *p <= '9') {
+        n = n * 10u + static_cast<uint32_t>(*p++ - '0');
     }
-};
+    return n;
+}
 
 struct RadixHeap {
     struct Item { uint64_t key; uint32_t value; };
@@ -69,16 +66,20 @@ struct RadixHeap {
     }
 };
 
+struct Edge {
+    uint32_t v;
+    uint32_t w;
+};
+
 struct Worker {
     const std::vector<uint32_t>& offsets;
-    const std::vector<uint32_t>& heads;
-    const std::vector<uint32_t>& weights;
+    const std::vector<Edge>& edges;
     std::vector<uint64_t> distance;
     std::vector<uint32_t> seen;
     uint32_t stamp = 1;
     RadixHeap heap;
-    Worker(const std::vector<uint32_t>& off, const std::vector<uint32_t>& to, const std::vector<uint32_t>& weight)
-        : offsets(off), heads(to), weights(weight), distance(off.size() - 1), seen(off.size() - 1, 0) {}
+    Worker(const std::vector<uint32_t>& off, const std::vector<Edge>& e)
+        : offsets(off), edges(e), distance(off.size() - 1), seen(off.size() - 1, 0) {}
     int64_t shortest(uint32_t source, uint32_t target) {
         if (source == target) return 0;
         if (++stamp == 0) { std::fill(seen.begin(), seen.end(), 0); stamp = 1; }
@@ -89,9 +90,10 @@ struct Worker {
             if (seen[cur.value] != stamp || distance[cur.value] != cur.key) continue;
             if (cur.value == target) return static_cast<int64_t>(cur.key);
             for (uint32_t e = offsets[cur.value]; e < offsets[cur.value + 1]; ++e) {
-                const uint32_t v = heads[e]; const uint64_t nd = cur.key + weights[e];
-                if (seen[v] != stamp || nd < distance[v]) {
-                    seen[v] = stamp; distance[v] = nd; heap.push(nd, v);
+                const Edge edge = edges[e];
+                const uint64_t nd = cur.key + edge.w;
+                if (seen[edge.v] != stamp || nd < distance[edge.v]) {
+                    seen[edge.v] = stamp; distance[edge.v] = nd; heap.push(nd, edge.v);
                 }
             }
         }
@@ -99,66 +101,137 @@ struct Worker {
     }
 };
 
-static inline void append_i64(std::string& out, int64_t n) {
-    char buf[24]; auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), n); out.append(buf, p);
-}
-
 int main() {
     Mapping graph_file("/data/graph.txt");
-    Reader first{graph_file.data, graph_file.data + graph_file.size};
-    const uint32_t n = first.number(); const uint32_t m = first.number();
+    const char* gp = graph_file.data;
+    const char* gend = gp + graph_file.size;
+
+    const uint32_t n = fast_parse_uint(gp, gend);
+    const uint32_t m = fast_parse_uint(gp, gend);
+    while (gp < gend && *gp != '\n') ++gp;
+    if (gp < gend) ++gp;
+    const char* edges_start = gp;
+    const size_t edges_bytes = static_cast<size_t>(gend - edges_start);
+
+    constexpr unsigned WORKERS = 12;
+    const char* starts[WORKERS + 1];
+    starts[0] = edges_start;
+    starts[WORKERS] = gend;
+    for (unsigned w = 1; w < WORKERS; ++w) {
+        const char* probe = edges_start + (edges_bytes * w / WORKERS);
+        const char* nl = static_cast<const char*>(std::memchr(probe, '\n', static_cast<size_t>(gend - probe)));
+        starts[w] = nl ? nl + 1 : gend;
+    }
+
+    struct RawEdge { uint32_t u, v, w; };
+    std::vector<std::vector<RawEdge>> local_edges(WORKERS);
+    std::vector<std::vector<uint32_t>> local_deg(WORKERS, std::vector<uint32_t>(n, 0));
+
+    auto parse_chunk = [&](unsigned w) {
+        const char* p = starts[w];
+        const char* limit = starts[w + 1];
+        auto& edges = local_edges[w];
+        edges.reserve((m / WORKERS) + 5000);
+        auto& deg = local_deg[w];
+
+        while (p < limit) {
+            uint32_t u = fast_parse_uint(p, limit);
+            if (p >= limit) break;
+            uint32_t v = fast_parse_uint(p, limit);
+            uint32_t weight = fast_parse_uint(p, limit);
+            edges.push_back({u, v, weight});
+            deg[u]++;
+        }
+    };
+    {
+        std::vector<std::thread> pool; pool.reserve(WORKERS);
+        for (unsigned w = 0; w < WORKERS; ++w) pool.emplace_back(parse_chunk, w);
+        for (auto& t : pool) t.join();
+    }
+
     std::vector<uint32_t> offsets(static_cast<size_t>(n) + 1, 0);
-    for (uint32_t i = 0; i < m; ++i) { const uint32_t u = first.number(); first.number(); first.number(); ++offsets[u + 1]; }
-    for (uint32_t i = 1; i <= n; ++i) offsets[i] += offsets[i - 1];
-    std::vector<uint32_t> write_pos = offsets;
-    std::vector<uint32_t> heads(m), weights(m);
-    Reader second{graph_file.data, graph_file.data + graph_file.size}; second.number(); second.number();
-    for (uint32_t i = 0; i < m; ++i) {
-        const uint32_t u = second.number(), v = second.number(), w = second.number();
-        const uint32_t slot = write_pos[u]++; heads[slot] = v; weights[slot] = w;
+    for (uint32_t u = 0; u < n; ++u) {
+        uint32_t d = 0;
+        for (unsigned w = 0; w < WORKERS; ++w) d += local_deg[w][u];
+        offsets[u + 1] = offsets[u] + d;
+    }
+
+    std::vector<std::vector<uint32_t>> worker_slot(WORKERS, std::vector<uint32_t>(n));
+    for (uint32_t u = 0; u < n; ++u) {
+        uint32_t cur = offsets[u];
+        for (unsigned w = 0; w < WORKERS; ++w) {
+            worker_slot[w][u] = cur;
+            cur += local_deg[w][u];
+        }
+    }
+
+    std::vector<Edge> edges(m);
+    auto fill_csr = [&](unsigned w) {
+        auto& slot = worker_slot[w];
+        const auto& raw = local_edges[w];
+        for (const auto& e : raw) {
+            const uint32_t idx = slot[e.u]++;
+            edges[idx] = {e.v, e.w};
+        }
+    };
+    {
+        std::vector<std::thread> pool; pool.reserve(WORKERS);
+        for (unsigned w = 0; w < WORKERS; ++w) pool.emplace_back(fill_csr, w);
+        for (auto& t : pool) t.join();
+    }
+    for (unsigned w = 0; w < WORKERS; ++w) {
+        local_edges[w].clear();
+        local_edges[w].shrink_to_fit();
+        local_deg[w].clear();
+        local_deg[w].shrink_to_fit();
     }
 
     Mapping query_file("/data/queries.txt");
-    Reader qr{query_file.data, query_file.data + query_file.size};
+    const char* qp = query_file.data;
+    const char* qend = qp + query_file.size;
     std::vector<std::pair<uint32_t, uint32_t>> queries;
     queries.reserve(2500);
-    while (qr.p < qr.end) {
-        uint32_t s = qr.number();
-        if (qr.p >= qr.end) break;
-        uint32_t t = qr.number();
+    while (qp < qend) {
+        uint32_t s = fast_parse_uint(qp, qend);
+        if (qp >= qend) break;
+        uint32_t t = fast_parse_uint(qp, qend);
         queries.push_back({s, t});
     }
+
     std::unordered_map<uint64_t, uint32_t> unique_index;
-    unique_index.reserve(queries.size() * 2);
     std::vector<std::pair<uint32_t, uint32_t>> unique;
     std::vector<uint32_t> remap(queries.size());
-    for (uint32_t i = 0; i < queries.size(); ++i) {
+    for (size_t i = 0; i < queries.size(); ++i) {
         const uint64_t key = (static_cast<uint64_t>(queries[i].first) << 32) | queries[i].second;
         auto [it, inserted] = unique_index.emplace(key, static_cast<uint32_t>(unique.size()));
         if (inserted) unique.push_back(queries[i]);
         remap[i] = it->second;
     }
+
     std::vector<int64_t> unique_answer(unique.size()), answers(queries.size());
     std::atomic<size_t> next{0};
-    constexpr unsigned WORKERS = 12;
-    const unsigned workers = std::min<unsigned>(WORKERS, static_cast<unsigned>(unique.size()));
-    std::vector<std::thread> pool;
-    pool.reserve(workers);
-    for (unsigned t = 0; t < workers; ++t) {
-        pool.emplace_back([&] {
-            Worker worker(offsets, heads, weights);
-            for (;;) {
-                const size_t i = next.fetch_add(1, std::memory_order_relaxed);
-                if (i >= unique.size()) break;
-                unique_answer[i] = worker.shortest(unique[i].first, unique[i].second);
-            }
-        });
+    {
+        std::vector<std::thread> pool; pool.reserve(WORKERS);
+        for (unsigned t = 0; t < WORKERS; ++t) {
+            pool.emplace_back([&] {
+                Worker worker(offsets, edges);
+                for (;;) {
+                    const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= unique.size()) break;
+                    unique_answer[i] = worker.shortest(unique[i].first, unique[i].second);
+                }
+            });
+        }
+        for (auto& t : pool) t.join();
     }
-    for (auto& thread : pool) thread.join();
     for (size_t i = 0; i < answers.size(); ++i) answers[i] = unique_answer[remap[i]];
-    std::string output; output.reserve(answers.size() * 12);
-    for (int64_t answer : answers) { append_i64(output, answer); output.push_back('\n'); }
 
+    std::string output; output.reserve(answers.size() * 12);
+    for (int64_t a : answers) {
+        char buf[24]; auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), a);
+        output.append(buf, p);
+        output.push_back('\n');
+    }
     const int out_fd = open("/out/distances.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) _exit(2);
     const char* wp = output.data();
