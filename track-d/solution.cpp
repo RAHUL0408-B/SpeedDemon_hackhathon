@@ -23,7 +23,7 @@ struct Mapping {
         if (fd < 0 || fstat(fd, &st) != 0) _exit(2);
         size = static_cast<size_t>(st.st_size);
         if (size) {
-            data = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
+            data = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0));
             if (data == MAP_FAILED) _exit(2);
             madvise(const_cast<char*>(data), size, MADV_SEQUENTIAL);
         }
