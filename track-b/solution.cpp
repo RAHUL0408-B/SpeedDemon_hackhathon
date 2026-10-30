@@ -30,15 +30,19 @@ struct Mapping {
     ~Mapping() { if (data && data != MAP_FAILED) munmap(const_cast<char*>(data), size); if (fd >= 0) close(fd); }
 };
 
-static inline bool token_char(unsigned char c) noexcept {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+alignas(64) static uint8_t IS_TOKEN[256];
+alignas(64) static uint8_t TO_LOWER[256];
+
+static void init_tables() noexcept {
+    for (int i = 0; i < 256; ++i) {
+        TO_LOWER[i] = (i >= 'A' && i <= 'Z') ? static_cast<uint8_t>(i + 32) : static_cast<uint8_t>(i);
+        IS_TOKEN[i] = ((i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z') || (i >= '0' && i <= '9')) ? 1 : 0;
+    }
 }
 
 static inline bool eq_ignore_case(const char* p, const char* word, size_t len) noexcept {
     for (size_t i = 0; i < len; ++i) {
-        char c = p[i];
-        if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
-        if (c != word[i]) return false;
+        if (TO_LOWER[static_cast<unsigned char>(p[i])] != static_cast<unsigned char>(word[i])) return false;
     }
     return true;
 }
@@ -46,9 +50,8 @@ static inline bool eq_ignore_case(const char* p, const char* word, size_t len) n
 static inline uint64_t fnv1a_case(const char* p, size_t len) noexcept {
     uint64_t h = 1469598103934665603ULL;
     for (size_t i = 0; i < len; ++i) {
-        unsigned char c = static_cast<unsigned char>(p[i]);
-        if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
-        h ^= c; h *= 1099511628211ULL;
+        h ^= TO_LOWER[static_cast<unsigned char>(p[i])];
+        h *= 1099511628211ULL;
     }
     return h == 0 ? 1 : h;
 }
@@ -110,8 +113,7 @@ static inline uint32_t insert_term(std::string_view word) {
     term_table[idx].len_and_id = (static_cast<uint32_t>(word.size()) << 24) | new_id;
 
     for (char c : word) {
-        if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
-        string_pool.push_back(c);
+        string_pool.push_back(static_cast<char>(TO_LOWER[static_cast<unsigned char>(c)]));
     }
     bloom_add(h);
     return new_id;
@@ -164,20 +166,29 @@ static Query parse_query(std::string_view line) {
 static inline bool phrase_in_doc_fast(const char* p, const char* end, const std::vector<std::string>& phrase) noexcept {
     const size_t phrase_len = phrase.size();
     if (phrase_len == 0) return true;
+    const char c0_lower = static_cast<char>(TO_LOWER[static_cast<unsigned char>(phrase[0][0])]);
+    const char c0_upper = static_cast<char>((c0_lower >= 'a' && c0_lower <= 'z') ? (c0_lower - 32) : c0_lower);
+    const size_t w0_len = phrase[0].size();
+
     while (p < end) {
-        while (p < end && !token_char(static_cast<unsigned char>(*p))) ++p;
+        while (p < end && !IS_TOKEN[static_cast<unsigned char>(*p)]) ++p;
         if (p >= end) break;
+        char c = *p;
+        if (c != c0_lower && c != c0_upper) {
+            while (p < end && IS_TOKEN[static_cast<unsigned char>(*p)]) ++p;
+            continue;
+        }
         const char* w_start = p;
-        while (p < end && token_char(static_cast<unsigned char>(*p))) ++p;
+        while (p < end && IS_TOKEN[static_cast<unsigned char>(*p)]) ++p;
         const size_t w_len = static_cast<size_t>(p - w_start);
-        if (w_len == phrase[0].size() && eq_ignore_case(w_start, phrase[0].data(), w_len)) {
+        if (w_len == w0_len && eq_ignore_case(w_start, phrase[0].data(), w_len)) {
             const char* cur = p;
             bool all_matched = true;
             for (size_t k = 1; k < phrase_len; ++k) {
-                while (cur < end && !token_char(static_cast<unsigned char>(*cur))) ++cur;
+                while (cur < end && !IS_TOKEN[static_cast<unsigned char>(*cur)]) ++cur;
                 if (cur >= end) { all_matched = false; break; }
                 const char* next_start = cur;
-                while (cur < end && token_char(static_cast<unsigned char>(*cur))) ++cur;
+                while (cur < end && IS_TOKEN[static_cast<unsigned char>(*cur)]) ++cur;
                 const size_t next_len = static_cast<size_t>(cur - next_start);
                 if (next_len != phrase[k].size() || !eq_ignore_case(next_start, phrase[k].data(), next_len)) {
                     all_matched = false; break;
@@ -190,31 +201,42 @@ static inline bool phrase_in_doc_fast(const char* p, const char* end, const std:
 }
 
 static inline void set_and(const std::vector<uint32_t>& a, const uint32_t* b, size_t b_len, std::vector<uint32_t>& out) {
-    out.clear(); out.reserve(std::min(a.size(), b_len));
-    size_t i = 0, j = 0;
-    while (i < a.size() && j < b_len) {
+    const size_t a_len = a.size();
+    out.resize(std::min(a_len, b_len));
+    uint32_t* dst = out.data();
+    size_t i = 0, j = 0, cnt = 0;
+    while (i < a_len && j < b_len) {
         if (a[i] < b[j]) ++i;
         else if (b[j] < a[i]) ++j;
-        else { out.push_back(a[i]); ++i; ++j; }
+        else { dst[cnt++] = a[i]; ++i; ++j; }
     }
+    out.resize(cnt);
 }
+
 static inline void set_or(const std::vector<uint32_t>& a, const uint32_t* b, size_t b_len, std::vector<uint32_t>& out) {
-    out.clear(); out.reserve(a.size() + b_len);
-    size_t i = 0, j = 0;
-    while (i < a.size() || j < b_len) {
-        if (j == b_len || (i < a.size() && a[i] < b[j])) out.push_back(a[i++]);
-        else if (i == a.size() || b[j] < a[i]) out.push_back(b[j++]);
-        else { out.push_back(a[i]); ++i; ++j; }
+    const size_t a_len = a.size();
+    out.resize(a_len + b_len);
+    uint32_t* dst = out.data();
+    size_t i = 0, j = 0, cnt = 0;
+    while (i < a_len || j < b_len) {
+        if (j == b_len || (i < a_len && a[i] < b[j])) dst[cnt++] = a[i++];
+        else if (i == a_len || b[j] < a[i]) dst[cnt++] = b[j++];
+        else { dst[cnt++] = a[i]; ++i; ++j; }
     }
+    out.resize(cnt);
 }
+
 static inline void set_not(const std::vector<uint32_t>& a, const uint32_t* b, size_t b_len, std::vector<uint32_t>& out) {
-    out.clear(); out.reserve(a.size());
-    size_t i = 0, j = 0;
-    while (i < a.size()) {
+    const size_t a_len = a.size();
+    out.resize(a_len);
+    uint32_t* dst = out.data();
+    size_t i = 0, j = 0, cnt = 0;
+    while (i < a_len) {
         while (j < b_len && b[j] < a[i]) ++j;
-        if (j == b_len || a[i] != b[j]) out.push_back(a[i]);
+        if (j == b_len || a[i] != b[j]) dst[cnt++] = a[i];
         ++i;
     }
+    out.resize(cnt);
 }
 
 static inline void append_uint(std::string& out, uint64_t n) {
@@ -231,6 +253,7 @@ static inline void append_result(std::string& out, const QueryResult& qr) {
 }
 
 int main() {
+    init_tables();
     string_pool.reserve(1024 * 1024);
     Mapping qfile("/data/queries.txt");
     std::vector<Query> queries; queries.reserve(50'000);
@@ -252,33 +275,38 @@ int main() {
         starts[w] = nl ? nl + 1 : starts[workers];
     }
 
-    uint32_t doc_counts[workers] = {};
-    std::vector<std::thread> pool; pool.reserve(workers);
-    for (unsigned w = 0; w < workers; ++w) {
-        pool.emplace_back([&, w]() {
-            const char* p = starts[w]; const char* limit = starts[w + 1];
-            uint32_t c = 0;
-            while (p < limit) {
-                const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(limit - p)));
-                if (!nl) break;
-                c++; p = nl + 1;
-            }
-            doc_counts[w] = c;
-        });
+    uint32_t doc_start[workers + 1];
+    doc_start[0] = 0;
+    for (unsigned w = 1; w < workers; ++w) {
+        const char* p = starts[w];
+        uint32_t n = 0;
+        while (p < starts[workers] && *p >= '0' && *p <= '9') n = n * 10u + (*p++ - '0');
+        doc_start[w] = n;
     }
-    for (auto& t : pool) t.join(); pool.clear();
-
-    uint32_t doc_start[workers + 1]; doc_start[0] = 0;
-    for (unsigned w = 0; w < workers; ++w) doc_start[w + 1] = doc_start[w] + doc_counts[w];
+    {
+        const char* p = starts[workers] - 2;
+        while (p > docs_file.data && *p != '\n') --p;
+        if (*p == '\n') ++p;
+        uint32_t n = 0;
+        while (p < starts[workers] && *p >= '0' && *p <= '9') n = n * 10u + (*p++ - '0');
+        doc_start[workers] = n + 1;
+    }
     const uint32_t total_docs = doc_start[workers];
     std::vector<Document> documents(total_docs);
 
+    std::vector<std::thread> pool; pool.reserve(workers);
+    std::vector<std::vector<uint32_t>> worker_tokens(workers);
+    std::vector<std::vector<uint16_t>> worker_doc_tok_count(workers);
     std::vector<std::vector<uint32_t>> term_counts(workers, std::vector<uint32_t>(term_count, 0));
+
     for (unsigned w = 0; w < workers; ++w) {
         pool.emplace_back([&, w]() {
             const char* p = starts[w]; const char* limit = starts[w + 1];
             uint32_t cur_doc = doc_start[w];
+            const uint32_t num_my_docs = doc_start[w + 1] - doc_start[w];
             auto& my_counts = term_counts[w];
+            auto& my_tokens = worker_tokens[w]; my_tokens.reserve(2'000'000);
+            auto& my_doc_counts = worker_doc_tok_count[w]; my_doc_counts.resize(num_my_docs);
             std::vector<uint32_t> last_seen(term_count, std::numeric_limits<uint32_t>::max());
 
             while (p < limit) {
@@ -289,15 +317,15 @@ int main() {
                 if (!nl) nl = limit;
                 documents[cur_doc] = {tb, nl};
 
+                uint16_t doc_toks = 0;
                 const char* tp = tb;
                 while (tp < nl) {
-                    while (tp < nl && !token_char(static_cast<unsigned char>(*tp))) ++tp;
+                    while (tp < nl && !IS_TOKEN[static_cast<unsigned char>(*tp)]) ++tp;
                     const char* wb = tp;
                     uint64_t h = 1469598103934665603ULL;
-                    while (tp < nl && token_char(static_cast<unsigned char>(*tp))) {
-                        unsigned char c = static_cast<unsigned char>(*tp++);
-                        if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
-                        h ^= c; h *= 1099511628211ULL;
+                    while (tp < nl && IS_TOKEN[static_cast<unsigned char>(*tp)]) {
+                        h ^= TO_LOWER[static_cast<unsigned char>(*tp++)];
+                        h *= 1099511628211ULL;
                     }
                     const size_t len = static_cast<size_t>(tp - wb);
                     if (len > 0 && bloom_test(h)) {
@@ -305,9 +333,12 @@ int main() {
                         if (tid >= 0 && last_seen[static_cast<size_t>(tid)] != cur_doc) {
                             last_seen[static_cast<size_t>(tid)] = cur_doc;
                             my_counts[static_cast<size_t>(tid)]++;
+                            my_tokens.push_back(static_cast<uint32_t>(tid));
+                            doc_toks++;
                         }
                     }
                 }
+                my_doc_counts[cur_doc - doc_start[w]] = doc_toks;
                 cur_doc++; p = nl < limit ? nl + 1 : limit;
             }
         });
@@ -334,34 +365,23 @@ int main() {
     for (unsigned w = 0; w < workers; ++w) {
         pool.emplace_back([&, w]() {
             const uint32_t first = doc_start[w]; const uint32_t last = doc_start[w + 1];
-            std::vector<uint32_t> last_seen(term_count, std::numeric_limits<uint32_t>::max());
             auto& my_pos = worker_write_pos[w];
+            const auto& my_tokens = worker_tokens[w];
+            const auto& my_counts = worker_doc_tok_count[w];
+            uint32_t tok_idx = 0;
 
             for (uint32_t cur_doc = first; cur_doc < last; ++cur_doc) {
-                const Document& doc = documents[cur_doc];
-                const char* tp = doc.begin; const char* nl = doc.end;
-                while (tp < nl) {
-                    while (tp < nl && !token_char(static_cast<unsigned char>(*tp))) ++tp;
-                    const char* wb = tp;
-                    uint64_t h = 1469598103934665603ULL;
-                    while (tp < nl && token_char(static_cast<unsigned char>(*tp))) {
-                        unsigned char c = static_cast<unsigned char>(*tp++);
-                        if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
-                        h ^= c; h *= 1099511628211ULL;
-                    }
-                    const size_t len = static_cast<size_t>(tp - wb);
-                    if (len > 0 && bloom_test(h)) {
-                        int tid = lookup_term(wb, len, h);
-                        if (tid >= 0 && last_seen[static_cast<size_t>(tid)] != cur_doc) {
-                            last_seen[static_cast<size_t>(tid)] = cur_doc;
-                            flat_postings[my_pos[static_cast<size_t>(tid)]++] = cur_doc;
-                        }
-                    }
+                const uint16_t num = my_counts[cur_doc - first];
+                for (uint16_t k = 0; k < num; ++k) {
+                    uint32_t tid = my_tokens[tok_idx++];
+                    flat_postings[my_pos[tid]++] = cur_doc;
                 }
             }
         });
     }
     for (auto& t : pool) t.join(); pool.clear();
+    worker_tokens.clear(); worker_tokens.shrink_to_fit();
+    worker_doc_tok_count.clear(); worker_doc_tok_count.shrink_to_fit();
 
     auto get_postings = [&](uint32_t tid) -> std::pair<const uint32_t*, size_t> {
         if (tid >= term_count) return {nullptr, 0};
