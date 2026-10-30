@@ -39,7 +39,7 @@ struct Mapping {
     }
 };
 
-/* ── Hash tables for interning ────────────────────────────────────────────── */
+/* ── Fast Hash tables for interning ───────────────────────────────────────── */
 struct HourTable {
     uint64_t keys[256];
     uint16_t ids[256];
@@ -60,7 +60,7 @@ struct HourTable {
         occupied[idx] = 1;
     }
 
-    uint16_t lookup(const char* p) const noexcept {
+    inline uint16_t lookup(const char* p) const noexcept {
         const uint64_t hval = hash_hour(p);
         uint32_t idx = hval & 255;
         while (occupied[idx]) {
@@ -78,17 +78,17 @@ struct EndpointTable {
     uint16_t ids[CAP];
     uint8_t  occupied[CAP] = {};
 
-    static inline uint64_t hash_sv(std::string_view sv) noexcept {
+    static inline uint64_t hash_sv(const char* p, size_t len) noexcept {
         uint64_t h = 14695981039346656037ULL;
-        for (char c : sv) {
-            h ^= static_cast<unsigned char>(c);
+        for (size_t i = 0; i < len; ++i) {
+            h ^= static_cast<unsigned char>(p[i]);
             h *= 1099511628211ULL;
         }
         return h;
     }
 
     void insert(std::string_view sv, uint16_t id) noexcept {
-        const uint64_t h = hash_sv(sv);
+        const uint64_t h = hash_sv(sv.data(), sv.size());
         uint32_t idx = h & MASK;
         while (occupied[idx]) idx = (idx + 1) & MASK;
         keys[idx] = sv;
@@ -96,16 +96,21 @@ struct EndpointTable {
         occupied[idx] = 1;
     }
 
-    uint16_t lookup(const char* ptr, size_t len) const noexcept {
-        std::string_view sv(ptr, len);
-        const uint64_t h = hash_sv(sv);
+    inline uint16_t lookup(const char* ptr, size_t len) const noexcept {
+        const uint64_t h = hash_sv(ptr, len);
         uint32_t idx = h & MASK;
         while (occupied[idx]) {
-            if (keys[idx] == sv) return ids[idx];
+            if (keys[idx].size() == len && std::memcmp(keys[idx].data(), ptr, len) == 0) return ids[idx];
             idx = (idx + 1) & MASK;
         }
         return 0;
     }
+};
+
+struct ParsedRecord {
+    uint32_t gid;
+    uint32_t latency;
+    bool is_5xx;
 };
 
 /* ── fast integer formatting ─────────────────────────────────────────────── */
@@ -148,19 +153,13 @@ int main() {
             if (!nl) nl = limit;
             p = nl < limit ? nl + 1 : limit;
 
-            if (nl - line < 35) continue; // safety check
-            // Hour is line[0..12]
+            if (nl - line < 35) continue;
             hours.emplace(line, 13);
 
-            // Skip to method space
             const char* q = line + 27;
-            if (*q != ' ') {
-                while (q < nl && *q != ' ') ++q;
-            }
-            // Skip method
+            if (*q != ' ') { while (q < nl && *q != ' ') ++q; }
             while (q < nl && *q == ' ') ++q;
-            while (q < nl && *q != ' ') ++q;
-            // Now at endpoint
+            while (q < nl && *q != ' ') ++q; // skip method
             while (q < nl && *q == ' ') ++q;
             const char* ep_start = q;
             while (q < nl && *q != ' ') ++q;
@@ -205,15 +204,17 @@ int main() {
     const uint32_t num_hours     = static_cast<uint32_t>(sorted_hours.size());
     const uint32_t num_groups    = num_hours * num_endpoints;
 
-    /* ── Pass 2: Count records per group per worker ─────────────────────── */
-    std::vector<std::vector<uint32_t>> thread_counts(
-        WORKERS, std::vector<uint32_t>(num_groups, 0));
-    std::vector<std::vector<uint32_t>> thread_errors(
-        WORKERS, std::vector<uint32_t>(num_groups, 0));
+    /* ── Pass 2: Parse into local worker memory buffers + count groups ───── */
+    std::vector<std::vector<ParsedRecord>> worker_records(WORKERS);
+    std::vector<std::vector<uint32_t>> thread_counts(WORKERS, std::vector<uint32_t>(num_groups, 0));
+    std::vector<std::vector<uint32_t>> thread_errors(WORKERS, std::vector<uint32_t>(num_groups, 0));
 
-    auto count_records = [&](unsigned w) {
+    auto parse_worker = [&](unsigned w) {
+        auto& records = worker_records[w];
+        records.reserve(270'000);
         auto& counts = thread_counts[w];
         auto& errors = thread_errors[w];
+
         const char* p     = starts[w];
         const char* limit = starts[w + 1];
 
@@ -226,7 +227,6 @@ int main() {
             if (nl - line < 35) continue;
 
             const uint16_t hid = hour_table.lookup(line);
-
             const char* q = line + 27;
             if (*q != ' ') { while (q < nl && *q != ' ') ++q; }
             while (q < nl && *q == ' ') ++q;
@@ -241,16 +241,24 @@ int main() {
 
             while (q < nl && *q == ' ') ++q;
             const bool is_5xx = (*q == '5');
+            while (q < nl && *q != ' ') ++q;
+            while (q < nl && *q == ' ') ++q;
 
-            ++counts[gid];
-            errors[gid] += static_cast<uint32_t>(is_5xx);
+            uint32_t lat = 0;
+            while (q < nl && *q >= '0' && *q <= '9') {
+                lat = lat * 10u + static_cast<uint32_t>(*q++ - '0');
+            }
+
+            records.push_back({gid, lat, is_5xx});
+            counts[gid]++;
+            if (is_5xx) errors[gid]++;
         }
     };
 
     {
         std::vector<std::thread> pool;
         pool.reserve(WORKERS);
-        for (unsigned i = 0; i < WORKERS; ++i) pool.emplace_back(count_records, i);
+        for (unsigned i = 0; i < WORKERS; ++i) pool.emplace_back(parse_worker, i);
         for (auto& t : pool) t.join();
     }
 
@@ -280,140 +288,123 @@ int main() {
         }
     }
 
-    /* ── Pass 3: Fill latencies into single flat buffer ─────────────────── */
+    /* ── Pass 3: Scatter latencies directly from memory buffers ─────────── */
     std::vector<uint32_t> all_latencies(total_records);
 
-    auto fill_latencies = [&](unsigned w) {
+    auto scatter_worker = [&](unsigned w) {
         auto& write_ptrs = thread_write_ptrs[w];
-        const char* p     = starts[w];
-        const char* limit = starts[w + 1];
-
-        while (p < limit) {
-            const char* line = p;
-            const char* nl = static_cast<const char*>(
-                std::memchr(line, '\n', static_cast<size_t>(limit - line)));
-            if (!nl) nl = limit;
-            p = nl < limit ? nl + 1 : limit;
-            if (nl - line < 35) continue;
-
-            const uint16_t hid = hour_table.lookup(line);
-
-            const char* q = line + 27;
-            if (*q != ' ') { while (q < nl && *q != ' ') ++q; }
-            while (q < nl && *q == ' ') ++q;
-            while (q < nl && *q != ' ') ++q;
-            while (q < nl && *q == ' ') ++q;
-            const char* ep_start = q;
-            while (q < nl && *q != ' ') ++q;
-            const size_t ep_len = static_cast<size_t>(q - ep_start);
-
-            const uint16_t eid = ep_table.lookup(ep_start, ep_len);
-            const uint32_t gid = static_cast<uint32_t>(hid) * num_endpoints + eid;
-
-            // skip status
-            while (q < nl && *q == ' ') ++q;
-            while (q < nl && *q != ' ') ++q;
-            // now at latency
-            while (q < nl && *q == ' ') ++q;
-            uint32_t lat = 0;
-            while (q < nl && *q >= '0' && *q <= '9') {
-                lat = lat * 10u + static_cast<uint32_t>(*q++ - '0');
-            }
-
-            all_latencies[write_ptrs[gid]++] = lat;
+        const auto& records = worker_records[w];
+        for (const auto& rec : records) {
+            all_latencies[write_ptrs[rec.gid]++] = rec.latency;
         }
     };
 
     {
         std::vector<std::thread> pool;
         pool.reserve(WORKERS);
-        for (unsigned i = 0; i < WORKERS; ++i) pool.emplace_back(fill_latencies, i);
+        for (unsigned i = 0; i < WORKERS; ++i) pool.emplace_back(scatter_worker, i);
         for (auto& t : pool) t.join();
     }
 
-    /* ── Pass 4: Compute percentiles & format output in parallel ─────────── */
-    std::vector<uint32_t> active_groups;
-    active_groups.reserve(num_groups / 2);
-    for (uint32_t g = 0; g < num_groups; ++g) {
-        if (total_counts[g] > 0) active_groups.push_back(g);
+    // Free worker memory buffers
+    for (unsigned w = 0; w < WORKERS; ++w) {
+        worker_records[w].clear();
+        worker_records[w].shrink_to_fit();
     }
 
-    const size_t n_active = active_groups.size();
-    std::vector<std::string> thread_outputs(WORKERS);
+    /* ── Fast percentiles per group ─────────────────────────────────────── */
+    auto sort_group = [&](uint32_t g) {
+        const uint32_t count = total_counts[g];
+        if (!count) return;
 
-    auto format_worker = [&](unsigned w) {
-        std::string& out = thread_outputs[w];
-        out.reserve(2 * 1024 * 1024);
+        const uint32_t offset = group_offsets[g];
+        uint32_t* base = &all_latencies[offset];
 
-        const size_t first = n_active * w / WORKERS;
-        const size_t last  = n_active * (w + 1) / WORKERS;
+        if (count == 1) return;
+        if (count == 2) {
+            if (base[1] < base[0]) std::swap(base[0], base[1]);
+            return;
+        }
+        if (count <= 16) {
+            std::sort(base, base + count);
+            return;
+        }
 
-        for (size_t i = first; i < last; ++i) {
-            const uint32_t gid = active_groups[i];
-            const uint32_t hid = gid / num_endpoints;
-            const uint32_t eid = gid % num_endpoints;
+        const uint32_t r50 = (50u * count + 99u) / 100u - 1u;
+        const uint32_t r95 = (95u * count + 99u) / 100u - 1u;
+        const uint32_t r99 = (99u * count + 99u) / 100u - 1u;
 
-            const uint32_t start = group_offsets[gid];
+        std::nth_element(base, base + r50, base + count);
+        std::nth_element(base + r50 + 1, base + r95, base + count);
+        std::nth_element(base + r95 + 1, base + r99, base + count);
+    };
+
+    {
+        std::atomic<uint32_t> next_g{0};
+        std::vector<std::thread> pool;
+        pool.reserve(WORKERS);
+        for (unsigned i = 0; i < WORKERS; ++i) {
+            pool.emplace_back([&]() {
+                for (;;) {
+                    uint32_t g = next_g.fetch_add(1, std::memory_order_relaxed);
+                    if (g >= num_groups) break;
+                    sort_group(g);
+                }
+            });
+        }
+        for (auto& t : pool) t.join();
+    }
+
+    /* ── Format output ──────────────────────────────────────────────────── */
+    std::string output;
+    output.reserve(8 * 1024 * 1024);
+
+    for (uint32_t hid = 0; hid < num_hours; ++hid) {
+        const std::string& hstr = sorted_hours[hid];
+        for (uint32_t eid = 0; eid < num_endpoints; ++eid) {
+            const uint32_t gid = hid * num_endpoints + eid;
             const uint32_t count = total_counts[gid];
-            uint32_t* base = &all_latencies[start];
+            if (!count) continue;
 
-            const size_t r50 = (50ULL * count + 99) / 100 - 1;
-            const size_t r95 = (95ULL * count + 99) / 100 - 1;
-            const size_t r99 = (99ULL * count + 99) / 100 - 1;
+            const uint32_t offset = group_offsets[gid];
+            const uint32_t* base = &all_latencies[offset];
 
-            if (count <= 64) {
-                std::sort(base, base + count);
-            } else {
-                std::nth_element(base, base + r50, base + count);
-                std::nth_element(base + r50 + 1, base + r95, base + count);
-                std::nth_element(base + r95 + 1, base + r99, base + count);
-            }
+            const uint32_t r50 = (50u * count + 99u) / 100u - 1u;
+            const uint32_t r95 = (95u * count + 99u) / 100u - 1u;
+            const uint32_t r99 = (99u * count + 99u) / 100u - 1u;
 
-            const uint32_t p50 = base[r50];
-            const uint32_t p95 = base[r95];
-            const uint32_t p99 = base[r99];
+            output.append(hstr);
+            output.append(":00:00Z ");
+            output.append(sorted_eps[eid]);
+            output.push_back(' ');
+            append_u64(output, count);
+            output.push_back(' ');
+            append_u64(output, base[r50]);
+            output.push_back(' ');
+            append_u64(output, base[r95]);
+            output.push_back(' ');
+            append_u64(output, base[r99]);
+            output.push_back(' ');
             const uint32_t errs = total_errors[gid];
-            const uint64_t ppm  = static_cast<uint64_t>(errs) * 1000000ULL / count;
-
-            out.append(sorted_hours[hid]);
-            out.append(":00:00Z ");
-            out.append(sorted_eps[eid]);
-            out.push_back(' ');
-            append_u64(out, count);
-            out.push_back(' ');
-            append_u64(out, p50);
-            out.push_back(' ');
-            append_u64(out, p95);
-            out.push_back(' ');
-            append_u64(out, p99);
-            out.push_back(' ');
-            append_u64(out, errs);
-            out.push_back(' ');
-            append_u64(out, ppm);
-            out.push_back('\n');
+            append_u64(output, errs);
+            output.push_back(' ');
+            const uint64_t ppm = static_cast<uint64_t>(errs) * 1000000ULL / count;
+            append_u64(output, ppm);
+            output.push_back('\n');
         }
-    };
-
-    {
-        std::vector<std::thread> pool;
-        pool.reserve(WORKERS);
-        for (unsigned i = 0; i < WORKERS; ++i) pool.emplace_back(format_worker, i);
-        for (auto& t : pool) t.join();
     }
 
-    /* ── Pass 5: Write output directly via write() ──────────────────────── */
+    /* ── Write output ───────────────────────────────────────────────────── */
     const int out_fd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) _exit(2);
 
-    for (unsigned w = 0; w < WORKERS; ++w) {
-        const char* wp = thread_outputs[w].data();
-        size_t rem     = thread_outputs[w].size();
-        while (rem) {
-            ssize_t written = write(out_fd, wp, rem);
-            if (written <= 0) _exit(2);
-            wp += written;
-            rem -= static_cast<size_t>(written);
-        }
+    const char* wp = output.data();
+    size_t rem     = output.size();
+    while (rem) {
+        ssize_t written = write(out_fd, wp, rem);
+        if (written <= 0) _exit(2);
+        wp += written;
+        rem -= static_cast<size_t>(written);
     }
     close(out_fd);
     return 0;

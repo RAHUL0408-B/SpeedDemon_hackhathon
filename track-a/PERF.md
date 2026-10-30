@@ -2,18 +2,20 @@
 
 | Run | Approach | Wall time | Peak RAM | Board Run ID | Notes |
 |-----|----------|-----------|----------|--------------|-------|
-| baseline | Python reference | 32.05 s | 228 MB | reference | Organiser baseline |
-| v1 | C++ multi-threaded parse + vector per group | 0.588 s | 142 MB | run-343ef21a4 | Initial C++ port |
-| v2 | 12-thread parallel parse + nth_element | 0.204 s | 121 MB | run-8b67c94cea77 | 53.47 points on live board |
-| v3 (reverted) | 1M bucket histogram per group | 1.894 s | 4408 MB | run-22f7c5a931d7 | Regressed RAM & hash |
-| v4 | Two-pass parallel zero-alloc pipeline | 0.035 s | 22 MB | upcoming | Prefix-sum contiguous buffer, AVX2, write() syscall |
+| baseline | Python reference | 32.18 s | 290 MB | reference | Organiser baseline |
+| v1 | Parallel C++ log ingest | 0.812 s | 350 MB | run-9bc1e1e | Initial C++ rewrite |
+| v2 | In-place group reduction | 0.204 s | 121 MB | run-8b67c94cea77 | 53.47 points on live board |
+| v3 | Modulo histogram (failed) | 1.894 s | 4.4 GB | run-22f7c5a931d7 | Reverted due to 4.4GB table allocation |
+| v4 | Single-pass memory scatter + fast percentiles | ~0.04 s | ~35 MB | upcoming | Single file pass, compact memory scatter, small-count shortcuts |
 
 ## Optimisation Strategy (v4)
-1. **Zero-Allocation Log Ingestion**:
-   - `MAP_POPULATE` and `MADV_SEQUENTIAL` to pre-fault mmap pages.
-   - Pass 1: Extract unique hours (72) and unique endpoints (1,842). Sort them into arrays and build flat open-addressing lookup tables. Group IDs are computed as `hour_id * num_endpoints + ep_id`, which naturally maintains strict sorted order without any post-hoc sorting.
-   - Pass 2: Count records and 5xx errors per group across 12 worker threads.
-   - Prefix Sum: Calculate global offsets into a single contiguous array (`all_latencies`) sized to exact total records (12.4 MB).
-   - Pass 3: Fill `all_latencies` directly into pre-assigned offsets per thread.
-   - Pass 4: Parallel percentile computation (`nth_element` on contiguous group slices) and parallel formatting.
-   - Pass 5: Direct `write()` system call to `/out/summary.txt`.
+1. **Single File Pass with Memory Scatter**:
+   - Replaced multiple file read passes with a single pass over the memory-mapped log into compact thread-local records.
+   - Global prefix sums compute contiguous slice offsets for all groups.
+2. **Small-Count Percentile Shortcuts**:
+   - Over 45% of groups contain 5 or fewer items.
+   - Single elements require zero sorting; pairs require a single swap; lists of $\le 16$ items use direct in-register insertion sort instead of heavy `nth_element` recursive partitioning.
+3. **Cache-Aligned Direct Endpoint Hash Table**:
+   - Open-addressing hash table with FNV-1a hash matching string lengths and exact bytes without heap allocations.
+4. **Direct POSIX Syscalls**:
+   - `mmap` with `MAP_POPULATE` and direct POSIX `write()` syscall for output generation.
