@@ -444,6 +444,19 @@ int main() {
         return {&flat_postings[term_offsets[tid]], term_total[tid]};
     };
 
+    // Dense bitmaps turn operations involving the very common terms into
+    // cache-friendly word operations. Sparse terms keep their compact postings.
+    const uint32_t bitmap_words = (total_docs + 63) >> 6;
+    std::vector<int32_t> dense_index(term_count, -1);
+    std::vector<uint64_t> dense_bits;
+    for (uint32_t term = 0; term < term_count; ++term) {
+        if (term_total[term] <= 4096) continue;
+        dense_index[term] = static_cast<int32_t>(dense_bits.size() / bitmap_words);
+        const size_t base = dense_bits.size(); dense_bits.resize(base + bitmap_words, 0);
+        const uint32_t* ids = flat_postings.data() + term_offsets[term];
+        for (uint32_t i = 0; i < term_total[term]; ++i) dense_bits[base + (ids[i] >> 6)] |= 1ULL << (ids[i] & 63);
+    }
+
     std::vector<std::string> local_out(workers);
 
     struct QueryContext {
@@ -456,6 +469,9 @@ int main() {
         const uint32_t* term_offsets;
         const uint32_t* term_total;
         uint32_t term_count;
+        const int32_t* dense_index;
+        const uint64_t* dense_bits;
+        uint32_t bitmap_words;
         std::string* out;
     };
 
@@ -477,6 +493,7 @@ int main() {
 
         std::vector<uint32_t> cur_res, tmp_res;
         cur_res.reserve(32768); tmp_res.reserve(32768);
+        std::vector<uint64_t> bits(ctx->bitmap_words), tmp_bits(ctx->bitmap_words);
         out.reserve(512 * 1024);
 
         for (size_t qi = first; qi < last; ++qi) {
@@ -523,18 +540,61 @@ int main() {
                 }
             } else {
                 auto [p0, len0] = get_postings_local(q.terms[0]);
-                cur_res.assign(p0, p0 + len0);
+                bool dense = ctx->dense_index[q.terms[0]] >= 0;
+                if (dense) {
+                    const uint64_t* src = ctx->dense_bits + static_cast<size_t>(ctx->dense_index[q.terms[0]]) * ctx->bitmap_words;
+                    std::memcpy(bits.data(), src, static_cast<size_t>(ctx->bitmap_words) * sizeof(uint64_t));
+                } else cur_res.assign(p0, p0 + len0);
                 for (size_t k = 0; k < q.ops.size(); ++k) {
                     auto [pk, lenk] = get_postings_local(q.terms[k + 1]);
-                    if (q.ops[k] == 0) set_and(cur_res, pk, lenk, tmp_res);
-                    else if (q.ops[k] == 1) set_or(cur_res, pk, lenk, tmp_res);
-                    else set_not(cur_res, pk, lenk, tmp_res);
-                    cur_res.swap(tmp_res);
+                    const int32_t right_dense = ctx->dense_index[q.terms[k + 1]];
+                    if (dense) {
+                        if (right_dense >= 0) {
+                            const uint64_t* rhs = ctx->dense_bits + static_cast<size_t>(right_dense) * ctx->bitmap_words;
+                            if (q.ops[k] == 0) for (uint32_t w = 0; w < ctx->bitmap_words; ++w) bits[w] &= rhs[w];
+                            else if (q.ops[k] == 1) for (uint32_t w = 0; w < ctx->bitmap_words; ++w) bits[w] |= rhs[w];
+                            else for (uint32_t w = 0; w < ctx->bitmap_words; ++w) bits[w] &= ~rhs[w];
+                        } else if (q.ops[k] == 0) {
+                            std::fill(tmp_bits.begin(), tmp_bits.end(), 0);
+                            for (size_t i = 0; i < lenk; ++i) if ((bits[pk[i] >> 6] >> (pk[i] & 63)) & 1ULL) tmp_bits[pk[i] >> 6] |= 1ULL << (pk[i] & 63);
+                            bits.swap(tmp_bits);
+                        } else if (q.ops[k] == 1) {
+                            for (size_t i = 0; i < lenk; ++i) bits[pk[i] >> 6] |= 1ULL << (pk[i] & 63);
+                        } else {
+                            for (size_t i = 0; i < lenk; ++i) bits[pk[i] >> 6] &= ~(1ULL << (pk[i] & 63));
+                        }
+                    } else if (right_dense >= 0) {
+                        const uint64_t* rhs = ctx->dense_bits + static_cast<size_t>(right_dense) * ctx->bitmap_words;
+                        if (q.ops[k] == 1) {
+                            std::memcpy(bits.data(), rhs, static_cast<size_t>(ctx->bitmap_words) * sizeof(uint64_t));
+                            for (uint32_t id : cur_res) bits[id >> 6] |= 1ULL << (id & 63);
+                            dense = true;
+                        } else {
+                            size_t dst = 0;
+                            for (uint32_t id : cur_res) {
+                                const bool present = (rhs[id >> 6] >> (id & 63)) & 1ULL;
+                                if ((q.ops[k] == 0 && present) || (q.ops[k] == 2 && !present)) cur_res[dst++] = id;
+                            }
+                            cur_res.resize(dst);
+                        }
+                    } else {
+                        if (q.ops[k] == 0) set_and(cur_res, pk, lenk, tmp_res);
+                        else if (q.ops[k] == 1) set_or(cur_res, pk, lenk, tmp_res);
+                        else set_not(cur_res, pk, lenk, tmp_res);
+                        cur_res.swap(tmp_res);
+                    }
                 }
-                qr.count = static_cast<uint32_t>(cur_res.size());
-                for (uint32_t id : cur_res) qr.sum += id;
-                qr.num10 = static_cast<uint8_t>(std::min<size_t>(cur_res.size(), 10));
-                for (size_t i = 0; i < qr.num10; ++i) qr.first10[i] = cur_res[i];
+                if (dense) {
+                    for (uint32_t w = 0; w < ctx->bitmap_words; ++w) {
+                        uint64_t word = bits[w]; qr.count += static_cast<uint32_t>(__builtin_popcountll(word));
+                        while (word) { const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(word)); const uint32_t id = (w << 6) + bit; qr.sum += id; if (qr.num10 < 10) qr.first10[qr.num10++] = id; word &= word - 1; }
+                    }
+                } else {
+                    qr.count = static_cast<uint32_t>(cur_res.size());
+                    for (uint32_t id : cur_res) qr.sum += id;
+                    qr.num10 = static_cast<uint8_t>(std::min<size_t>(cur_res.size(), 10));
+                    for (size_t i = 0; i < qr.num10; ++i) qr.first10[i] = cur_res[i];
+                }
             }
             append_result(out, qr);
         }
@@ -543,7 +603,7 @@ int main() {
 
     QueryContext q_contexts[workers];
     for (unsigned w = 0; w < workers; ++w) {
-        q_contexts[w] = {w, queries.size() * w / workers, queries.size() * (w + 1) / workers, &queries, documents.data(), flat_postings.data(), term_offsets.data(), term_total.data(), term_count, &local_out[w]};
+        q_contexts[w] = {w, queries.size() * w / workers, queries.size() * (w + 1) / workers, &queries, documents.data(), flat_postings.data(), term_offsets.data(), term_total.data(), term_count, dense_index.data(), dense_bits.data(), bitmap_words, &local_out[w]};
         pthread_create(&threads[w], &attr, query_worker, &q_contexts[w]);
     }
     for (unsigned w = 0; w < workers; ++w) pthread_join(threads[w], nullptr);
