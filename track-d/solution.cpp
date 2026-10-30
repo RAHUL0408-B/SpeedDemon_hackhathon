@@ -165,7 +165,8 @@ int main() {
 
     std::vector<int64_t> uans(uq.size()), ans(q.size());
     std::atomic<size_t> next{0};
-    for (unsigned t = 0; t < W; ++t) {
+    constexpr unsigned QUERY_WORKERS = 12;
+    for (unsigned t = 0; t < QUERY_WORKERS; ++t) {
         pool.emplace_back([&] {
             Worker worker(off, edges);
             for (;;) {
