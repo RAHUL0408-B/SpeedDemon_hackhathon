@@ -5,4 +5,4 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
-| 1 | C++ byte CSV parser and direct region join | Pending first board run | | | |
+| 1 | C++ byte CSV parser and direct region join | run-08fb4e53bb8b | 2.741923 | 201.2 | 17.56 |

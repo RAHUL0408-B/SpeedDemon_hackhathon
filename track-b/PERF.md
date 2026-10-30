@@ -5,4 +5,4 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
-| 1 | C++ query-targeted postings and phrase candidates | Pending first board run | | | |
+| 1 | C++ query-targeted postings and phrase candidates | run-70289dcfe09f | 12.317284 | 145.0 | 23.60 |
