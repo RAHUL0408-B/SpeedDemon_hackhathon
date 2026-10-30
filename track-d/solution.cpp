@@ -125,7 +125,7 @@ int main() {
     }
     std::vector<int64_t> unique_answer(unique.size()), answers(queries.size());
     std::atomic<size_t> next{0};
-    const unsigned workers = std::min<unsigned>(6, static_cast<unsigned>(unique.size()));
+    const unsigned workers = std::min<unsigned>(12, static_cast<unsigned>(unique.size()));
     std::vector<std::thread> pool;
     pool.reserve(workers);
     for (unsigned t = 0; t < workers; ++t) {
