@@ -1,10 +1,13 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -33,6 +36,13 @@ struct Group {
     uint32_t errors = 0;
 };
 
+struct LocalData {
+    std::unordered_map<std::string_view, int> endpoints;
+    std::vector<Group> groups;
+    std::string hours[72];
+    LocalData() { endpoints.reserve(2048); }
+};
+
 static uint32_t parse_u32(const char* p, const char* end) {
     uint32_t out = 0;
     while (p < end) out = out * 10u + static_cast<uint32_t>(*p++ - '0');
@@ -47,43 +57,59 @@ static void append_u64(std::string& out, uint64_t n) {
 
 int main() {
     Mapping input("/data/requests.log");
-    std::unordered_map<std::string_view, int> endpoints;
-    endpoints.reserve(2048);
+    const char* begin = input.data;
+    const char* finish = input.data + input.size;
+    constexpr unsigned workers = 12;
+    const char* starts[workers + 1]; starts[0] = begin; starts[workers] = finish;
+    for (unsigned i = 1; i < workers; ++i) {
+        const char* probe = begin + input.size * i / workers;
+        const char* nl = static_cast<const char*>(std::memchr(probe, '\n', static_cast<size_t>(finish - probe)));
+        starts[i] = nl + 1;
+    }
+    std::vector<LocalData> locals(workers);
+    auto parse_range = [&](unsigned worker) {
+        LocalData& local = locals[worker];
+        const char* p = starts[worker]; const char* limit = starts[worker + 1];
+        while (p < limit) {
+            const char* line = p;
+            const char* nl = static_cast<const char*>(std::memchr(line, '\n', static_cast<size_t>(limit - line)));
+            p = nl + 1;
+            const int day = (line[8] - '0') * 10 + (line[9] - '0');
+            const int hour = (line[11] - '0') * 10 + (line[12] - '0');
+            const int bucket = (line[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
+            if (local.hours[bucket].empty()) local.hours[bucket].assign(line, 13);
+            const char* q = line + 28; while (*q != ' ') ++q;
+            const char* ep_begin = ++q; while (*q != ' ') ++q;
+            const std::string_view endpoint(ep_begin, static_cast<size_t>(q - ep_begin));
+            auto found = local.endpoints.find(endpoint); int endpoint_id;
+            if (found == local.endpoints.end()) {
+                endpoint_id = static_cast<int>(local.endpoints.size()); local.endpoints.emplace(endpoint, endpoint_id);
+                local.groups.resize(static_cast<size_t>(endpoint_id + 1) * 72);
+            } else endpoint_id = found->second;
+            const char* status = q + 1; const char* latency = status + 4;
+            Group& g = local.groups[static_cast<size_t>(endpoint_id) * 72 + bucket];
+            g.latency.push_back(parse_u32(latency, nl)); g.errors += static_cast<uint32_t>(status[0] == '5');
+        }
+    };
+    std::vector<std::thread> pool; pool.reserve(workers);
+    for (unsigned i = 0; i < workers; ++i) pool.emplace_back(parse_range, i);
+    for (auto& thread : pool) thread.join();
+    std::unordered_map<std::string_view, int> endpoints; endpoints.reserve(2048);
     std::vector<Group> groups;
     std::string hours[72];
-
-    const char* p = input.data;
-    const char* finish = input.data + input.size;
-    while (p < finish) {
-        const char* line = p;
-        const char* nl = p;
-        while (nl < finish && *nl != '\n') ++nl;
-        p = nl + (nl < finish);
-
-        const int day = (line[8] - '0') * 10 + (line[9] - '0');
-        const int hour = (line[11] - '0') * 10 + (line[12] - '0');
-        const int bucket = (line[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
-        if (hours[bucket].empty()) hours[bucket].assign(line, 13);
-
-        const char* q = line + 28;                 // timestamp and its following space
-        while (*q != ' ') ++q;                      // method
-        const char* ep_begin = ++q;
-        while (*q != ' ') ++q;
-        const std::string_view endpoint(ep_begin, static_cast<size_t>(q - ep_begin));
-        auto found = endpoints.find(endpoint);
-        int endpoint_id;
-        if (found == endpoints.end()) {
-            endpoint_id = static_cast<int>(endpoints.size());
-            endpoints.emplace(endpoint, endpoint_id);
-            groups.resize(static_cast<size_t>(endpoint_id + 1) * 72);
-        } else {
-            endpoint_id = found->second;
+    for (auto& local : locals) {
+        for (int h = 0; h < 72; ++h) if (hours[h].empty() && !local.hours[h].empty()) hours[h] = local.hours[h];
+        for (const auto& [name, local_id] : local.endpoints) {
+            auto found = endpoints.find(name); int id;
+            if (found == endpoints.end()) { id = static_cast<int>(endpoints.size()); endpoints.emplace(name, id); groups.resize(static_cast<size_t>(id + 1) * 72); }
+            else id = found->second;
+            for (int h = 0; h < 72; ++h) {
+                Group& target = groups[static_cast<size_t>(id) * 72 + h];
+                Group& source = local.groups[static_cast<size_t>(local_id) * 72 + h];
+                target.errors += source.errors;
+                target.latency.insert(target.latency.end(), std::make_move_iterator(source.latency.begin()), std::make_move_iterator(source.latency.end()));
+            }
         }
-        const char* status = q + 1;
-        const char* latency = status + 4;
-        Group& g = groups[static_cast<size_t>(endpoint_id) * 72 + bucket];
-        g.latency.push_back(parse_u32(latency, nl));
-        g.errors += static_cast<uint32_t>(status[0] == '5');
     }
 
     std::vector<int> order(endpoints.size());
