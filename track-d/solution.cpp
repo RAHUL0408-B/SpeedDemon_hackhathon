@@ -98,7 +98,7 @@ int main() {
     while (gp < gend && *gp++ != '\n');
     const char* es = gp; const size_t eb = static_cast<size_t>(gend - es);
 
-    constexpr unsigned W = 12;
+    constexpr unsigned W = 6;
     const char* st[W + 1]; st[0] = es; st[W] = gend;
     for (unsigned w = 1; w < W; ++w) {
         const char* p = es + (eb * w / W);
@@ -144,6 +144,7 @@ int main() {
     }
     for (auto& t : pool) t.join();
     pool.clear();
+    ws.clear(); ws.shrink_to_fit();
 
     Mapping qf("/data/queries.txt");
     const char* qp = qf.data; const char* qend = qp + qf.size;
