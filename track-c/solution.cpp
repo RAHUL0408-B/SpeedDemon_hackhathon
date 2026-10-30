@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -104,6 +105,15 @@ struct Aggregate {
     }
 };
 
+static void merge_aggregate(Aggregate& into, Aggregate& from) {
+    if (!from.count) return;
+    if (!into.count) { into.minimum = from.minimum; into.maximum = from.maximum; }
+    else { if (from.minimum < into.minimum) into.minimum = from.minimum; if (from.maximum > into.maximum) into.maximum = from.maximum; }
+    into.count += from.count; into.id_sum += from.id_sum; into.amount_sum += from.amount_sum;
+    into.name_bytes += from.name_bytes; into.note_bytes += from.note_bytes;
+    into.names.merge(from.names);
+}
+
 static uint32_t pack_code(const char* p) {
     return (static_cast<uint32_t>(static_cast<unsigned char>(p[0])) << 16) |
            (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 8) |
@@ -143,25 +153,47 @@ int main() {
         region_to_country[region] = static_cast<uint16_t>(id + 1);
     }
 
-    std::vector<Aggregate> totals(countries.size() + 1);
     Mapping records_file("/data/records.csv");
     p = records_file.data;
     const char* records_end = p + records_file.size;
     if (records_end - p >= 3 && static_cast<unsigned char>(p[0]) == 0xef && static_cast<unsigned char>(p[1]) == 0xbb && static_cast<unsigned char>(p[2]) == 0xbf) p += 3;
     while (p < records_end && *p++ != '\n') {}
-    while (p < records_end) {
-        if (records_end - p >= 3 && static_cast<unsigned char>(p[0]) == 0xef && static_cast<unsigned char>(p[1]) == 0xbb && static_cast<unsigned char>(p[2]) == 0xbf) p += 3;
-        const uint32_t record_id = read_uint(p); ++p;
-        const Field name = read_field(p); ++p;
-        const Field note = read_field(p); ++p;
-        const uint32_t region = read_uint(p); ++p;
-        const int64_t amount = read_cents(p);
-        if (*p == '\r') ++p;
-        if (p < records_end && *p == '\n') ++p;
-        const uint16_t mapped = region < region_to_country.size() ? region_to_country[region] : 0;
-        const size_t group = mapped ? static_cast<size_t>(mapped - 1) : countries.size();
-        totals[group].add(record_id, name, note, amount);
+    const char* records_begin = p;
+    // Find only true CSV record boundaries. Newlines inside quoted notes are data.
+    std::vector<const char*> boundaries; boundaries.reserve(3'400'000); boundaries.push_back(records_begin);
+    bool quoted = false;
+    for (const char* scan = records_begin; scan < records_end; ++scan) {
+        if (*scan == '"') {
+            if (quoted && scan + 1 < records_end && scan[1] == '"') ++scan;
+            else quoted = !quoted;
+        } else if (*scan == '\n' && !quoted) boundaries.push_back(scan + 1);
     }
+    const unsigned workers = std::min<unsigned>(12, static_cast<unsigned>(boundaries.size() - 1));
+    std::vector<std::vector<Aggregate>> partial(workers, std::vector<Aggregate>(countries.size() + 1));
+    auto parse_range = [&](unsigned worker) {
+        const size_t first = (boundaries.size() - 1) * worker / workers;
+        const size_t last = (boundaries.size() - 1) * (worker + 1) / workers;
+        const char* cursor = boundaries[first]; const char* limit = boundaries[last];
+        auto& totals = partial[worker];
+        while (cursor < limit) {
+            if (limit - cursor >= 3 && static_cast<unsigned char>(cursor[0]) == 0xef && static_cast<unsigned char>(cursor[1]) == 0xbb && static_cast<unsigned char>(cursor[2]) == 0xbf) cursor += 3;
+            const uint32_t record_id = read_uint(cursor); ++cursor;
+            const Field name = read_field(cursor); ++cursor;
+            const Field note = read_field(cursor); ++cursor;
+            const uint32_t region = read_uint(cursor); ++cursor;
+            const int64_t amount = read_cents(cursor);
+            if (*cursor == '\r') ++cursor;
+            if (cursor < limit && *cursor == '\n') ++cursor;
+            const uint16_t mapped = region < region_to_country.size() ? region_to_country[region] : 0;
+            const size_t group = mapped ? static_cast<size_t>(mapped - 1) : countries.size();
+            totals[group].add(record_id, name, note, amount);
+        }
+    };
+    std::vector<std::thread> pool; pool.reserve(workers);
+    for (unsigned i = 0; i < workers; ++i) pool.emplace_back(parse_range, i);
+    for (auto& thread : pool) thread.join();
+    std::vector<Aggregate> totals(countries.size() + 1);
+    for (auto& shard : partial) for (size_t i = 0; i < totals.size(); ++i) merge_aggregate(totals[i], shard[i]);
 
     std::vector<uint16_t> order;
     for (uint16_t i = 0; i < countries.size(); ++i) if (totals[i].count) order.push_back(i);
