@@ -48,8 +48,7 @@ static inline uint64_t fnv1a_case(const char* p, size_t len) noexcept {
     for (size_t i = 0; i < len; ++i) {
         unsigned char c = static_cast<unsigned char>(p[i]);
         if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
-        h ^= c;
-        h *= 1099511628211ULL;
+        h ^= c; h *= 1099511628211ULL;
     }
     return h == 0 ? 1 : h;
 }
@@ -76,9 +75,7 @@ static constexpr uint32_t TABLE_CAP = 262144;
 static constexpr uint32_t TABLE_MASK = TABLE_CAP - 1;
 
 struct TableEntry {
-    uint64_t hash = 0;
-    uint32_t str_offset = 0;
-    uint32_t len_and_id = 0;
+    uint64_t hash = 0; uint32_t str_offset = 0; uint32_t len_and_id = 0;
     uint16_t len() const noexcept { return static_cast<uint16_t>(len_and_id >> 24); }
     uint32_t id() const noexcept { return len_and_id & 0x00FFFFFF; }
 };
@@ -126,7 +123,13 @@ struct Query {
     std::vector<uint32_t> terms;
     std::vector<std::string> phrase_words;
     std::vector<uint8_t> ops;
-    std::vector<uint32_t> matches;
+};
+
+struct QueryResult {
+    uint32_t count = 0;
+    uint64_t sum = 0;
+    uint32_t first10[10] = {};
+    uint8_t num10 = 0;
 };
 
 static Query parse_query(std::string_view line) {
@@ -217,11 +220,13 @@ static inline void set_not(const std::vector<uint32_t>& a, const uint32_t* b, si
 static inline void append_uint(std::string& out, uint64_t n) {
     char buf[24]; auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), n); out.append(buf, p);
 }
-static inline void append_result(std::string& out, const std::vector<uint32_t>& ids) {
-    append_uint(out, ids.size()); out.push_back(' ');
-    uint64_t sum = 0; for (uint32_t id : ids) sum += id;
-    append_uint(out, sum);
-    for (size_t i = 0; i < ids.size() && i < 10; ++i) { out.push_back(' '); append_uint(out, ids[i]); }
+static inline void append_result(std::string& out, const QueryResult& qr) {
+    append_uint(out, qr.count); out.push_back(' ');
+    append_uint(out, qr.sum);
+    for (size_t i = 0; i < qr.num10; ++i) {
+        out.push_back(' ');
+        append_uint(out, qr.first10[i]);
+    }
     out.push_back('\n');
 }
 
@@ -363,14 +368,18 @@ int main() {
         return {&flat_postings[term_offsets[tid]], term_total[tid]};
     };
 
+    std::vector<std::string> local_out(workers);
     for (unsigned w = 0; w < workers; ++w) {
         pool.emplace_back([&, w]() {
             const size_t first = queries.size() * w / workers;
             const size_t last = queries.size() * (w + 1) / workers;
             std::vector<uint32_t> cur_res, tmp_res;
+            cur_res.reserve(32768); tmp_res.reserve(32768);
+            local_out[w].reserve(512 * 1024);
 
             for (size_t qi = first; qi < last; ++qi) {
-                Query& q = queries[qi];
+                const Query& q = queries[qi];
+                QueryResult qr;
                 if (q.phrase) {
                     std::vector<uint32_t> needed = q.terms;
                     std::sort(needed.begin(), needed.end());
@@ -378,7 +387,10 @@ int main() {
 
                     bool absent = false;
                     for (uint32_t id : needed) if (term_total[id] == 0) { absent = true; break; }
-                    if (absent) continue;
+                    if (absent) {
+                        append_result(local_out[w], qr);
+                        continue;
+                    }
 
                     std::sort(needed.begin(), needed.end(), [&](uint32_t a, uint32_t b) {
                         return term_total[a] < term_total[b];
@@ -393,10 +405,13 @@ int main() {
                         cur_res.swap(tmp_res);
                     }
 
-                    q.matches.reserve(cur_res.size());
                     for (uint32_t id : cur_res) {
                         const Document& doc = documents[id];
-                        if (phrase_in_doc_fast(doc.begin, doc.end, q.phrase_words)) q.matches.push_back(id);
+                        if (phrase_in_doc_fast(doc.begin, doc.end, q.phrase_words)) {
+                            qr.count++;
+                            qr.sum += id;
+                            if (qr.num10 < 10) qr.first10[qr.num10++] = id;
+                        }
                     }
                 } else {
                     auto [p0, len0] = get_postings(q.terms[0]);
@@ -408,23 +423,26 @@ int main() {
                         else set_not(cur_res, pk, lenk, tmp_res);
                         cur_res.swap(tmp_res);
                     }
-                    q.matches = std::move(cur_res);
+                    qr.count = static_cast<uint32_t>(cur_res.size());
+                    for (uint32_t id : cur_res) qr.sum += id;
+                    qr.num10 = static_cast<uint8_t>(std::min<size_t>(cur_res.size(), 10));
+                    for (size_t i = 0; i < qr.num10; ++i) qr.first10[i] = cur_res[i];
                 }
+                append_result(local_out[w], qr);
             }
         });
     }
     for (auto& t : pool) t.join(); pool.clear();
 
-    std::string output; output.reserve(4 * 1024 * 1024);
-    for (const Query& q : queries) append_result(output, q.matches);
-
     const int out_fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) _exit(2);
-    const char* wp = output.data(); size_t rem = output.size();
-    while (rem > 0) {
-        ssize_t written = write(out_fd, wp, rem);
-        if (written <= 0) _exit(2);
-        wp += written; rem -= static_cast<size_t>(written);
+    for (unsigned w = 0; w < workers; ++w) {
+        const char* wp = local_out[w].data(); size_t rem = local_out[w].size();
+        while (rem > 0) {
+            ssize_t written = write(out_fd, wp, rem);
+            if (written <= 0) _exit(2);
+            wp += written; rem -= static_cast<size_t>(written);
+        }
     }
     close(out_fd);
     return 0;
