@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <fcntl.h>
 #include <fstream>
@@ -9,6 +10,7 @@
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -181,26 +183,41 @@ int main() {
     for (const std::string& line : lines) queries.push_back(parse_query(line));
 
     const size_t term_count = term_ids.size();
-    std::vector<std::vector<uint32_t>> postings(term_count);
     Mapping docs_file("/data/docs.txt");
     std::vector<Document> documents; documents.reserve(250'000);
-    std::vector<uint32_t> last_seen(term_count, std::numeric_limits<uint32_t>::max());
     const char* p = docs_file.data; const char* end = p + docs_file.size;
-    uint32_t doc_id = 0;
     while (p < end) {
-        while (*p++ != '\t') {}
-        const char* begin = p; while (p < end && *p != '\n') ++p;
+        const char* tab = static_cast<const char*>(std::memchr(p, '\t', static_cast<size_t>(end - p)));
+        p = tab + 1;
+        const char* begin = p; const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
+        p = nl;
         documents.push_back({begin, p});
-        const Document doc{begin, p};
-        scan_tokens(doc, [&](int id) {
-            if (id >= 0 && last_seen[static_cast<size_t>(id)] != doc_id) {
-                last_seen[static_cast<size_t>(id)] = doc_id;
-                postings[static_cast<size_t>(id)].push_back(doc_id);
-            }
-        });
         if (p < end) ++p;
-        ++doc_id;
     }
+    constexpr unsigned workers = 12;
+    std::vector<std::vector<std::vector<uint32_t>>> local_postings(
+        workers, std::vector<std::vector<uint32_t>>(term_count));
+    auto index_range = [&](unsigned worker) {
+        const size_t first = documents.size() * worker / workers;
+        const size_t last = documents.size() * (worker + 1) / workers;
+        std::vector<uint32_t> last_seen(term_count, std::numeric_limits<uint32_t>::max());
+        auto& local = local_postings[worker];
+        for (size_t i = first; i < last; ++i) {
+            scan_tokens(documents[i], [&](int id) {
+                if (id >= 0 && last_seen[static_cast<size_t>(id)] != i) {
+                    last_seen[static_cast<size_t>(id)] = static_cast<uint32_t>(i);
+                    local[static_cast<size_t>(id)].push_back(static_cast<uint32_t>(i));
+                }
+            });
+        }
+    };
+    std::vector<std::thread> pool; pool.reserve(workers);
+    for (unsigned i = 0; i < workers; ++i) pool.emplace_back(index_range, i);
+    for (auto& thread : pool) thread.join();
+    std::vector<std::vector<uint32_t>> postings(term_count);
+    for (unsigned worker = 0; worker < workers; ++worker)
+        for (size_t term = 0; term < term_count; ++term)
+            postings[term].insert(postings[term].end(), local_postings[worker][term].begin(), local_postings[worker][term].end());
 
     std::vector<std::vector<Watch>> watches(term_count);
     std::vector<uint32_t> difficult;
