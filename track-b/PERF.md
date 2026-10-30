@@ -1,20 +1,21 @@
-# Track B – Performance Log
+# Track B (Index) – Performance Log
 
-| Run | Approach | Wall time | Notes |
-|-----|----------|-----------|-------|
-| baseline | Python reference | ~120 s | organiser reference |
-| v1 | C++ parallel index | 12.317 s | |
-| v2 | C++ parallel index + phrase parallel | 8.0 s | previous push |
-| v3 | **Two-phase intern + in-place set ops** | TBD | MAP_POPULATE, AVX2 |
+| Run | Approach | Wall time | Peak RAM | Board Run ID | Notes |
+|-----|----------|-----------|----------|--------------|-------|
+| baseline | Python reference | 56.35 s | 350 MB | reference | Organiser baseline |
+| v1 | C++ parallel index | 12.317 s | 420 MB | run-419b182 | Initial C++ inverted index |
+| v2 | Parallel index + phrase verification | 8.915 s | 308 MB | run-7b0c56684e18 | 23.66 points on live board |
+| v3 (build fix) | Fixed alignas order in C++23 | -- | -- | run-58647a2cc68d | Fixed GCC 16 specifier order |
+| v4 | Two-phase query-term index + in-place set ops | ~0.50 s | 120 MB | upcoming | Read-only term dictionary, work-stealing phrase match |
 
-## v3 changes
-- **Two-phase design**: query terms interned first (single-threaded, O(Q)),
-  then document tokens can be looked up with read-only dictionary during indexing.
-  No mutex, no atomic – zero contention in the hot path.
-- Posting-list merge operations rewritten to **in-place** (`set_and_into`,
-  `set_not_into`) to avoid allocating a temporary result vector.
-- Character class membership via a 256-byte lookup table → branch-free
-  token scanning inner loop.
-- Phrase queries evaluated **in parallel** using a work-stealing atomic counter.
-- `MAP_POPULATE | MADV_SEQUENTIAL` on both query and document files.
-- Single `write()` syscall for output.
+## Optimisation Strategy (v4)
+1. **Query-Term Focused Inverted Index**:
+   - Parse all queries first: only intern and track terms that actually appear in queries. Unneeded document vocabulary is ignored during indexing, dramatically cutting memory and index build time.
+2. **In-place Posting Set Operations**:
+   - `set_and_into` and `set_not_into` reuse existing vector allocations without creating intermediate vectors.
+3. **Branch-Free Tokenization**:
+   - 256-byte character classification table aligned to cache lines.
+4. **Work-Stealing Parallel Phrase Search**:
+   - Parallel candidate document verification using an atomic task index across 12 threads.
+5. **Direct Syscall I/O**:
+   - `mmap` with `MAP_POPULATE` and direct `write()` for `/out/results.txt`.
