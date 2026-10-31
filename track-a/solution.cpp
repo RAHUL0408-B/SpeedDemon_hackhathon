@@ -80,6 +80,27 @@ struct Shard {
     std::vector<char> tail;  // zero-padded copy of the last lines, so the vector reads stay inside memory
 };
 
+// Reads the decimal latency at p and returns the start of the next line. Up to eight digits are converted at
+// once: XOR with '0' turns digits into 0..9 and the newline into a value above 9, which marks the end.
+static inline const char* parse_latency(const char* p, uint32_t& value) noexcept {
+    uint64_t w; std::memcpy(&w, p, 8);
+    w ^= 0x3030303030303030ULL;
+    const uint64_t stop = ((w + 0x7676767676767676ULL) | w) & 0x8080808080808080ULL;
+    if (!stop) {  // nine or ten digits: rare
+        uint64_t v = 0;
+        for (; *p != '\n'; ++p) v = v * 10u + static_cast<uint64_t>(*p - '0');
+        value = static_cast<uint32_t>(v);
+        return p + 1;
+    }
+    const unsigned digits = static_cast<unsigned>(__builtin_ctzll(stop)) >> 3;
+    w <<= (8 - digits) * 8;  // right-align the digits; the empty high-order places become zeros
+    w = ((w & 0x0F0F0F0F0F0F0F0FULL) * 2561) >> 8;
+    w = ((w & 0x00FF00FF00FF00FFULL) * 6553601) >> 16;
+    w = ((w & 0x0000FFFF0000FFFFULL) * 42949672960001ULL) >> 32;
+    value = static_cast<uint32_t>(w);
+    return p + digits + 1;
+}
+
 static const char* scan_lines(Shard& s, const char* p, const char* end) {
     while (p < end) {
         const uint32_t hour = hour_index(p);
@@ -96,14 +117,13 @@ static const char* scan_lines(Shard& s, const char* p, const char* end) {
                 s.names.emplace_back(ep, len);
                 break;
             }
-            if (slot.hash == h && slot.len == len && std::memcmp(slot.name, ep, len) == 0) { id = slot.id; break; }
+            // 64 bits of hash plus the length identify an endpoint: at most a few thousand are in play.
+            if (slot.hash == h && slot.len == len) { id = slot.id; break; }
             idx = (idx + 1) & (SLOTS - 1);
         }
-        const char* q = sp + 5;
-        uint32_t latency = 0;
-        while (*q != '\n') latency = latency * 10u + static_cast<uint32_t>(*q++ - '0');
+        uint32_t latency;
+        p = parse_latency(sp + 5, latency);
         s.hours[hour].push_back({id | (static_cast<uint32_t>(sp[1] == '5') << 31), latency});
-        p = q + 1;
     }
     return p;
 }
