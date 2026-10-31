@@ -234,7 +234,7 @@ int main() {
 
                 if (count > 1) {
                     if (count == 2) { if (base[1] < base[0]) std::swap(base[0], base[1]); }
-                    else if (count <= 16) { std::sort(base, base + count); }
+                    else if (count <= 64) { std::sort(base, base + count); }
                     else {
                         const uint32_t r50 = (50u * count + 99u) / 100u - 1u;
                         const uint32_t r95 = (95u * count + 99u) / 100u - 1u;
