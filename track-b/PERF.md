@@ -19,3 +19,19 @@
    - Instead of converting all tokens of candidate documents into IDs via hash map lookups, `phrase_in_doc_fast` performs zero-allocation sequential token scanning directly over document bytes.
 4. **Direct Syscall I/O**:
    - Memory mapping with `MAP_POPULATE` and direct POSIX `write()` syscalls for results output.
+
+## v5: tokenizer, batching, common-term bitmaps (local Docker numbers, board run ID pending)
+
+Profile of v4 on the full dataset (250k docs, 50k queries): parse queries 42 ms, scan 280 ms, scatter 120-200 ms, dense build 55 ms, queries 230 ms, about 800 ms in total. Output sha256 f86973c2...0927 at every step.
+
+| Step | Local wall time |
+|------|-----------------|
+| v4 | ~800 ms |
+| AVX2 tokenizer, word-wise hash, batched and prefetched term lookups | ~600 ms |
+| SIMD phrase verification, parallel dense build, prefetched scatter, uninitialised postings array | ~350 ms |
+| Common terms found by sampling go straight to bitmaps in the scan | ~320-350 ms |
+
+1. **Scan.** Token boundaries come from a 32-byte classify and `movemask`. A token of up to eight bytes hashes in one multiply and maps one-to-one onto its hash. Candidates that pass the Bloom filter are resolved 64 at a time: prefetch the table slots, look them up, prefetch the per-term state, then update. That turned per-token dependent cache misses into overlapped ones. Pre-faulting the mmap with `MADV_POPULATE_READ` changed nothing (measured), which showed the scan was cache-miss-bound, not fault-bound.
+2. **Phrase queries** were 80% of query time. The verifier now finds the anchor word with a two-byte SIMD search and runs the exact neighbour checks only at hits.
+3. **Common terms.** 714 terms hold 54% of the postings. The first 800 documents give a document-frequency sample; the 1,202 terms seen in at least 8 of them get a bitmap row that the scan sets directly through a small cache-resident table. They never enter the postings lists. A wrong guess only costs speed. Result sums over a bitmap use six weighted popcounts per word instead of visiting each bit.
+4. Tried and dropped: `MADV_POPULATE_READ` on the docs mapping (no gain).

@@ -18,3 +18,18 @@
    - Across ~250 countries, the 12 worker threads sort and call `std::unique` on the concatenated 64-bit hash arrays in parallel, taking ~1 ms total.
 4. **Fast Memory-Mapped I/O**:
    - `MAP_POPULATE` and `MADV_SEQUENTIAL`, direct `write()` syscall for `/out/aggregates.txt`.
+
+## v5: bitmap distinct counting and batched joins (local Docker numbers, board run ID pending)
+
+Output sha256 d8088b1c...f536 at every step (full dataset, seed 1).
+
+| Step | Local wall time |
+|------|-----------------|
+| v4 per-worker hash vectors, sort and 12-way merge | ~230 ms (reduce step alone ~70 ms) |
+| Lock-free name table plus one bitmap row per country, no allocation per region row | ~185 ms |
+| `memchr` for quoted fields, word-wise name hash | ~110 ms |
+| 32-record batches with prefetch of region, name-table and bitmap lines | ~65 ms |
+
+1. **Distinct names per country.** A shared open-addressing table maps each name's 64-bit hash to a slot, and every country owns one bit per slot, so a country's distinct count is a popcount of its row. This removed the per-worker sorts and the merge.
+2. **Parsing.** Quoted fields are scanned with `memchr` for the next quote (`""` pairs counted, not copied), and names are hashed eight bytes at a time over the unescaped value. A page-touch test showed memory was not the limit; cache-miss latency was.
+3. **Batching.** Records are parsed into a 32-entry batch while the random accesses (region lookup, name table, bitmap word) are prefetched, then drained.
