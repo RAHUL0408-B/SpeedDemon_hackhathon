@@ -125,6 +125,19 @@ struct TableEntry {
 static TableEntry term_table[TABLE_CAP];
 static std::string string_pool;
 static uint32_t num_terms = 0;
+static std::vector<uint64_t> term_hash;    // by term id, for building the common-term table
+static std::vector<uint32_t> term_length;
+
+// The common terms, probed before the full table: a tiny table that stays in cache.
+static constexpr uint32_t DENSE_CAP = 8192;
+struct DenseEntry { uint64_t hash = 0; uint32_t row = 0, len = 0; };
+static DenseEntry dense_table[DENSE_CAP];
+
+static inline int dense_row(uint64_t h, size_t len) noexcept {
+    for (uint32_t slot = static_cast<uint32_t>(h) & (DENSE_CAP - 1); dense_table[slot].hash; slot = (slot + 1) & (DENSE_CAP - 1))
+        if (dense_table[slot].hash == h && dense_table[slot].len == len) return static_cast<int>(dense_table[slot].row);
+    return -1;
+}
 
 static inline int lookup_term(const char* p, size_t len, uint64_t h) noexcept {
     uint32_t idx = static_cast<uint32_t>(h) & TABLE_MASK;
@@ -154,6 +167,7 @@ static uint32_t insert_term(std::string_view word) {
         idx = (idx + 1) & TABLE_MASK;
     }
     const uint32_t id = num_terms++;
+    term_hash.push_back(h); term_length.push_back(static_cast<uint32_t>(word.size()));
     term_table[idx].hash = h;
     term_table[idx].str_offset = static_cast<uint32_t>(string_pool.size());
     term_table[idx].len_and_id = (static_cast<uint32_t>(word.size()) << 24) | id;
@@ -377,6 +391,41 @@ int main() {
     const uint32_t total_docs = doc_start[workers];
     std::vector<Document> documents(total_docs);
 
+    // Very common terms get a bitmap row instead of a postings list. They are picked by document frequency over
+    // the first few hundred documents; a wrong guess only costs speed, never correctness.
+    const uint32_t bitmap_words = (total_docs + 63) >> 6;
+    std::vector<int32_t> dense_index(term_count, -1);
+    std::vector<uint32_t> dense_terms;
+    {
+        constexpr uint32_t SAMPLE_DOCS = 800, MIN_DF = 8;
+        std::vector<uint16_t> df(term_count, 0);
+        std::vector<uint32_t> last(term_count, std::numeric_limits<uint32_t>::max());
+        const char* p = docs_file.data; const char* const end = starts[workers];
+        for (uint32_t doc = 0; doc < SAMPLE_DOCS && p < end; ++doc) {
+            const char* tab = static_cast<const char*>(std::memchr(p, '\t', static_cast<size_t>(end - p)));
+            if (!tab) break;
+            const char* nl = static_cast<const char*>(std::memchr(tab, '\n', static_cast<size_t>(end - tab)));
+            if (!nl || nl + 64 > end) break;
+            scan_tokens(tab + 1, nl, [&](const char* s, size_t len) {
+                const uint64_t h = hash_token(s, len);
+                if (!bloom_test(h)) return;
+                const int t = lookup_term(nullptr, len, h);
+                if (t >= 0 && last[static_cast<size_t>(t)] != doc) { last[static_cast<size_t>(t)] = doc; ++df[static_cast<size_t>(t)]; }
+            });
+            p = nl + 1;
+        }
+        for (uint32_t t = 0; t < term_count; ++t) {
+            if (df[t] < MIN_DF || dense_terms.size() >= DENSE_CAP / 2) continue;
+            dense_index[t] = static_cast<int32_t>(dense_terms.size());
+            uint32_t slot = static_cast<uint32_t>(term_hash[t]) & (DENSE_CAP - 1);
+            while (dense_table[slot].hash) slot = (slot + 1) & (DENSE_CAP - 1);
+            dense_table[slot] = {term_hash[t], static_cast<uint32_t>(dense_terms.size()), term_length[t]};
+            dense_terms.push_back(t);
+        }
+    }
+    // calloc hands back lazily zeroed pages, so the scan threads take the zero-fill faults in parallel.
+    uint64_t* const dense_bits = static_cast<uint64_t*>(std::calloc(dense_terms.size() * bitmap_words + 1, sizeof(uint64_t)));
+
     std::vector<std::vector<uint32_t>> worker_tokens(workers);
     std::vector<std::vector<uint16_t>> worker_doc_tok_count(workers);
     std::vector<std::vector<uint32_t>> term_counts(workers, std::vector<uint32_t>(term_count, 0));
@@ -398,6 +447,8 @@ int main() {
         std::vector<uint32_t>* my_tokens;
         std::vector<uint16_t>* my_doc_counts;
         const char* file_end;
+        uint64_t* dense_bits;
+        uint32_t bitmap_words, first_word, last_word;  // last_word: the worker's last bitmap word, shared with its neighbour
     };
 
     auto pass1_worker = [](void* arg_ptr) -> void* {
@@ -411,7 +462,7 @@ int main() {
         std::vector<LastCount> lc(ctx->term_count, LastCount{std::numeric_limits<uint32_t>::max(), 0});
         struct Cand { uint64_t h; uint32_t len; };
         constexpr unsigned BATCH = 64;
-        Cand cand[BATCH]; int tids[BATCH];
+        Cand cand[BATCH]; int tids[BATCH], rows[BATCH];
         {   // Pre-fault this worker's slice in one call instead of one fault per page.
             const uintptr_t lo = reinterpret_cast<uintptr_t>(p) & ~uintptr_t(4095);
             madvise(reinterpret_cast<void*>(lo), reinterpret_cast<uintptr_t>(limit) - lo, 22 /* MADV_POPULATE_READ */);
@@ -427,10 +478,24 @@ int main() {
 
             uint16_t doc_toks = 0;
             unsigned nc = 0;
-            // Resolve a batch: prefetch every table slot, look them up, prefetch the per-term state, then update.
+            // Resolve a batch in stages so the cache misses overlap: probe the common-term table and prefetch the
+            // bitmap word or the full-table slot, then do the writes and lookups, then update the per-term state.
             auto flush = [&]() {
-                for (unsigned i = 0; i < nc; ++i) __builtin_prefetch(&term_table[static_cast<uint32_t>(cand[i].h) & TABLE_MASK]);
                 for (unsigned i = 0; i < nc; ++i) {
+                    rows[i] = dense_row(cand[i].h, cand[i].len);
+                    if (rows[i] >= 0) __builtin_prefetch(&ctx->dense_bits[static_cast<size_t>(rows[i]) * ctx->bitmap_words + (cur_doc >> 6)], 1);
+                    else __builtin_prefetch(&term_table[static_cast<uint32_t>(cand[i].h) & TABLE_MASK]);
+                }
+                const uint32_t word_index = cur_doc >> 6;
+                const uint64_t bit = 1ULL << (cur_doc & 63);
+                for (unsigned i = 0; i < nc; ++i) {
+                    if (rows[i] >= 0) {  // a common term: set its bit; only the edge words are shared with a neighbour
+                        uint64_t* word = &ctx->dense_bits[static_cast<size_t>(rows[i]) * ctx->bitmap_words + word_index];
+                        if (word_index == ctx->first_word || word_index == ctx->last_word) __atomic_fetch_or(word, bit, __ATOMIC_RELAXED);
+                        else *word |= bit;
+                        tids[i] = -1;
+                        continue;
+                    }
                     tids[i] = lookup_term(nullptr, cand[i].len, cand[i].h);
                     if (tids[i] >= 0) __builtin_prefetch(&lc[static_cast<size_t>(tids[i])], 1);
                 }
@@ -446,10 +511,9 @@ int main() {
             };
             auto emit = [&](const char* s, size_t len) {
                 const uint64_t h = hash_token(s, len);
-                if (bloom_test(h)) {
-                    cand[nc++] = {h, static_cast<uint32_t>(len)};
-                    if (nc == BATCH) flush();
-                }
+                if (!bloom_test(h)) return;
+                cand[nc++] = {h, static_cast<uint32_t>(len)};
+                if (nc == BATCH) flush();
             };
             if (nl + 64 <= ctx->file_end) scan_tokens(tb, nl, emit);
             else {  // the vector loads and 8-byte hashes read past the end: use a zero-padded copy
@@ -467,7 +531,8 @@ int main() {
 
     Pass1Context p1_contexts[workers];
     for (unsigned w = 0; w < workers; ++w) {
-        p1_contexts[w] = {w, starts[w], starts[w + 1], doc_start[w], doc_start[w + 1] - doc_start[w], term_count, documents.data(), &term_counts[w], &worker_tokens[w], &worker_doc_tok_count[w], starts[workers]};
+        p1_contexts[w] = {w, starts[w], starts[w + 1], doc_start[w], doc_start[w + 1] - doc_start[w], term_count, documents.data(), &term_counts[w], &worker_tokens[w], &worker_doc_tok_count[w], starts[workers],
+                         dense_bits, bitmap_words, doc_start[w] >> 6, (doc_start[w + 1] - 1) >> 6};
         pthread_create(&threads[w], &attr, pass1_worker, &p1_contexts[w]);
     }
     for (unsigned w = 0; w < workers; ++w) pthread_join(threads[w], nullptr);
@@ -530,41 +595,21 @@ int main() {
     worker_tokens.clear(); worker_tokens.shrink_to_fit();
     worker_doc_tok_count.clear(); worker_doc_tok_count.shrink_to_fit();
 
-    auto get_postings = [&](uint32_t tid) -> std::pair<const uint32_t*, size_t> {
-        if (tid >= term_count) return {nullptr, 0};
-        return {&flat_postings[term_offsets[tid]], term_total[tid]};
-    };
-
-    // Dense bitmaps turn operations involving the very common terms into
-    // cache-friendly word operations. Sparse terms keep their compact postings.
-    const uint32_t bitmap_words = (total_docs + 63) >> 6;
-    std::vector<int32_t> dense_index(term_count, -1);
-    std::vector<uint32_t> dense_terms;
-    for (uint32_t term = 0; term < term_count; ++term) {
-        if (term_total[term] <= 4096) continue;
-        dense_index[term] = static_cast<int32_t>(dense_terms.size());
-        dense_terms.push_back(term);
-    }
-    // calloc hands back lazily zeroed pages, so the build threads below also take the zero-fill faults.
-    uint64_t* const dense_bits = static_cast<uint64_t*>(std::calloc(dense_terms.size() * bitmap_words + 1, sizeof(uint64_t)));
-    struct DenseContext {
-        unsigned w; const std::vector<uint32_t>* terms; const uint32_t* postings; const uint32_t* offsets;
-        const uint32_t* totals; uint64_t* bits; uint32_t words;
-    };
-    auto dense_worker = [](void* arg_ptr) -> void* {
-        const DenseContext* c = static_cast<const DenseContext*>(arg_ptr);
+    // The scan only set bits for the common terms; their document counts come from the bitmaps.
+    struct CountContext { unsigned w; const std::vector<uint32_t>* terms; uint64_t* bits; uint32_t words; uint32_t* totals; };
+    auto count_worker = [](void* arg_ptr) -> void* {
+        const CountContext* c = static_cast<const CountContext*>(arg_ptr);
         for (size_t i = c->w; i < c->terms->size(); i += workers) {
-            const uint32_t term = (*c->terms)[i];
-            uint64_t* dst = c->bits + i * c->words;
-            const uint32_t* ids = c->postings + c->offsets[term];
-            for (uint32_t j = 0; j < c->totals[term]; ++j) dst[ids[j] >> 6] |= 1ULL << (ids[j] & 63);
+            uint32_t n = 0;
+            for (uint32_t j = 0; j < c->words; ++j) n += static_cast<uint32_t>(__builtin_popcountll(c->bits[i * c->words + j]));
+            c->totals[(*c->terms)[i]] = n;
         }
         return nullptr;
     };
-    DenseContext d_contexts[workers];
+    CountContext c_contexts[workers];
     for (unsigned w = 0; w < workers; ++w) {
-        d_contexts[w] = {w, &dense_terms, flat_postings.get(), term_offsets.data(), term_total.data(), dense_bits, bitmap_words};
-        pthread_create(&threads[w], &attr, dense_worker, &d_contexts[w]);
+        c_contexts[w] = {w, &dense_terms, dense_bits, bitmap_words, term_total.data()};
+        pthread_create(&threads[w], &attr, count_worker, &c_contexts[w]);
     }
     for (unsigned w = 0; w < workers; ++w) pthread_join(threads[w], nullptr);
 
@@ -602,6 +647,8 @@ int main() {
             return {&flat_postings[term_offsets[tid]], term_total[tid]};
         };
 
+        auto row_of = [&](uint32_t tid) { return ctx->dense_bits + static_cast<size_t>(ctx->dense_index[tid]) * ctx->bitmap_words; };
+
         std::vector<uint32_t> cur_res, tmp_res;
         cur_res.reserve(32768); tmp_res.reserve(32768);
         std::vector<uint64_t> bits(ctx->bitmap_words), tmp_bits(ctx->bitmap_words);
@@ -632,10 +679,24 @@ int main() {
                     if (q.terms[k] == rarest_tid) { anchor_idx = k; break; }
                 }
 
-                auto [p0, len0] = get_postings_local(needed[0]);
-                cur_res.assign(p0, p0 + len0);
+                if (ctx->dense_index[needed[0]] >= 0) {
+                    const uint64_t* row = row_of(needed[0]);
+                    cur_res.clear();
+                    for (uint32_t w = 0; w < ctx->bitmap_words; ++w)
+                        for (uint64_t x = row[w]; x; x &= x - 1) cur_res.push_back((w << 6) + static_cast<uint32_t>(__builtin_ctzll(x)));
+                } else {
+                    auto [p0, len0] = get_postings_local(needed[0]);
+                    cur_res.assign(p0, p0 + len0);
+                }
 
                 for (size_t k = 1; k < needed.size() && !cur_res.empty(); ++k) {
+                    if (ctx->dense_index[needed[k]] >= 0) {
+                        const uint64_t* row = row_of(needed[k]);
+                        size_t dst = 0;
+                        for (uint32_t id : cur_res) if ((row[id >> 6] >> (id & 63)) & 1ULL) cur_res[dst++] = id;
+                        cur_res.resize(dst);
+                        continue;
+                    }
                     auto [pk, lenk] = get_postings_local(needed[k]);
                     set_and(cur_res, pk, lenk, tmp_res);
                     cur_res.swap(tmp_res);
@@ -651,7 +712,7 @@ int main() {
                 }
             } else {
                 auto [p0, len0] = get_postings_local(q.terms[0]);
-                if (q.ops.empty()) {
+                if (q.ops.empty() && ctx->dense_index[q.terms[0]] < 0) {
                     qr.count = static_cast<uint32_t>(len0);
                     qr.num10 = static_cast<uint8_t>(std::min<size_t>(len0, 10));
                     for (size_t i = 0; i < len0; ++i) qr.sum += p0[i];
@@ -704,10 +765,21 @@ int main() {
                     }
                 }
                 if (dense) {
+                    // Sum of the set positions without visiting each bit: bit k of a position is set in exactly the
+                    // positions picked by POSITION_BIT[k], so the sum is the weighted popcount of those masks.
+                    static constexpr uint64_t POSITION_BIT[6] = {0xAAAAAAAAAAAAAAAAULL, 0xCCCCCCCCCCCCCCCCULL, 0xF0F0F0F0F0F0F0F0ULL,
+                                                                 0xFF00FF00FF00FF00ULL, 0xFFFF0000FFFF0000ULL, 0xFFFFFFFF00000000ULL};
                     for (uint32_t w = 0; w < ctx->bitmap_words; ++w) {
-                        uint64_t word = bits[w]; qr.count += static_cast<uint32_t>(__builtin_popcountll(word));
-                        while (word) { const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(word)); const uint32_t id = (w << 6) + bit; qr.sum += id; if (qr.num10 < 10) qr.first10[qr.num10++] = id; word &= word - 1; }
+                        const uint64_t word = bits[w];
+                        const uint64_t c = static_cast<uint64_t>(__builtin_popcountll(word));
+                        qr.count += static_cast<uint32_t>(c);
+                        uint64_t in_word = 0;
+                        for (unsigned k = 0; k < 6; ++k) in_word += static_cast<uint64_t>(__builtin_popcountll(word & POSITION_BIT[k])) << k;
+                        qr.sum += (static_cast<uint64_t>(w) << 6) * c + in_word;
                     }
+                    for (uint32_t w = 0; w < ctx->bitmap_words && qr.num10 < 10; ++w)
+                        for (uint64_t x = bits[w]; x && qr.num10 < 10; x &= x - 1)
+                            qr.first10[qr.num10++] = (w << 6) + static_cast<uint32_t>(__builtin_ctzll(x));
                 } else {
                     qr.count = static_cast<uint32_t>(cur_res.size());
                     for (uint32_t id : cur_res) qr.sum += id;
