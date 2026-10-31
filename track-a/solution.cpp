@@ -1,8 +1,12 @@
+#pragma GCC optimize("O3")
+#pragma GCC target("avx2,bmi,bmi2,popcnt")
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <immintrin.h>
 #include <pthread.h>
 #include <string>
 #include <string_view>
@@ -11,34 +15,10 @@
 #include <unistd.h>
 #include <vector>
 
-struct Mapping {
-    int fd = -1; size_t size = 0; const char* data = nullptr;
-    explicit Mapping(const char* path) {
-        fd = open(path, O_RDONLY); struct stat st{};
-        if (fd < 0 || fstat(fd, &st) != 0) _exit(2);
-        size = static_cast<size_t>(st.st_size);
-        if (size) {
-            data = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0));
-            if (data == MAP_FAILED) _exit(2);
-            madvise(const_cast<char*>(data), size, MADV_SEQUENTIAL);
-        }
-    }
-    ~Mapping() { if (data && data != MAP_FAILED) munmap(const_cast<char*>(data), size); if (fd >= 0) close(fd); }
-};
+constexpr unsigned WORKERS = 12, HOURS = 72, SLOTS = 4096;
+constexpr size_t SAFE_TAIL = 256;  // a line is at most 177 bytes and the vector scans read up to 31 past it
 
-static inline void append_u64(std::string& out, uint64_t n) {
-    char buf[24]; auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), n); out.append(buf, p);
-}
-
-static inline uint32_t hour_to_idx(const char* p) noexcept {
-    const uint32_t month = (static_cast<uint32_t>(p[5] - '0') * 10u) + static_cast<uint32_t>(p[6] - '0');
-    const uint32_t day = (static_cast<uint32_t>(p[8] - '0') * 10u) + static_cast<uint32_t>(p[9] - '0');
-    const uint32_t hr = (static_cast<uint32_t>(p[11] - '0') * 10u) + static_cast<uint32_t>(p[12] - '0');
-    const uint32_t day_off = (month == 10) ? (day - 30u) : (day + 1u);
-    return day_off * 24u + hr - 18u;
-}
-
-static const char* const HOUR_STRINGS[72] = {
+static const char* const HOUR_STRINGS[HOURS] = {
     "2026-10-30T18","2026-10-30T19","2026-10-30T20","2026-10-30T21","2026-10-30T22","2026-10-30T23",
     "2026-10-31T00","2026-10-31T01","2026-10-31T02","2026-10-31T03","2026-10-31T04","2026-10-31T05",
     "2026-10-31T06","2026-10-31T07","2026-10-31T08","2026-10-31T09","2026-10-31T10","2026-10-31T11",
@@ -52,236 +32,229 @@ static const char* const HOUR_STRINGS[72] = {
     "2026-11-02T06","2026-11-02T07","2026-11-02T08","2026-11-02T09","2026-11-02T10","2026-11-02T11",
     "2026-11-02T12","2026-11-02T13","2026-11-02T14","2026-11-02T15","2026-11-02T16","2026-11-02T17"};
 
-struct FastMap {
-    static constexpr uint32_t CAP = 4096, MASK = CAP - 1;
-    std::string_view keys[CAP];
-    uint32_t vals[CAP];
-    uint8_t occupied[CAP] = {};
+// Hour of the 72-hour span (0 = 2026-10-30T18) from the fixed-width timestamp.
+static inline uint32_t hour_index(const char* p) noexcept {
+    const uint32_t month = static_cast<uint32_t>(p[5] - '0') * 10u + static_cast<uint32_t>(p[6] - '0');
+    const uint32_t day = static_cast<uint32_t>(p[8] - '0') * 10u + static_cast<uint32_t>(p[9] - '0');
+    const uint32_t hour = static_cast<uint32_t>(p[11] - '0') * 10u + static_cast<uint32_t>(p[12] - '0');
+    return ((month == 10 ? day - 30u : day + 1u) * 24u) + hour - 18u;
+}
 
-    static inline uint64_t hash_sv(const char* p, size_t len) noexcept {
-        uint64_t h = 14695981039346656037ULL;
-        for (size_t i = 0; i < len; ++i) { h ^= static_cast<unsigned char>(p[i]); h *= 1099511628211ULL; }
-        return h;
+static inline uint64_t hash_bytes(const char* p, size_t n) noexcept {
+    uint64_t h = (n + 1) * 0x9E3779B97F4A7C15ULL;
+    for (; n >= 8; p += 8, n -= 8) {
+        uint64_t w; std::memcpy(&w, p, 8);
+        h = (h ^ w) * 0xD6E8FEB86659FD93ULL; h ^= h >> 32;
     }
+    if (n) {
+        uint64_t w = 0; std::memcpy(&w, p, n);
+        h = (h ^ w) * 0xD6E8FEB86659FD93ULL; h ^= h >> 32;
+    }
+    h *= 0x9E3779B97F4A7C15ULL;
+    return h ^ (h >> 29);
+}
 
-    inline int32_t get_or_insert(std::string_view sv, uint32_t new_id) noexcept {
-        const uint64_t h = hash_sv(sv.data(), sv.size()); uint32_t idx = h & MASK;
-        while (occupied[idx]) {
-            if (keys[idx].size() == sv.size() && std::memcmp(keys[idx].data(), sv.data(), sv.size()) == 0) return static_cast<int32_t>(vals[idx]);
-            idx = (idx + 1) & MASK;
-        }
-        keys[idx] = sv; vals[idx] = new_id; occupied[idx] = 1;
-        return -1;
+static inline const char* find_space(const char* p) noexcept {
+    const __m256i space = _mm256_set1_epi8(' ');
+    for (;; p += 32) {
+        const uint32_t m = static_cast<uint32_t>(_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)), space)));
+        if (m) return p + __builtin_ctz(m);
     }
+}
+
+static inline void append_u64(std::string& out, uint64_t n) {
+    char buf[24]; auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), n); out.append(buf, p);
+}
+
+struct Rec { uint32_t key, lat; };  // key: the shard's endpoint id, top bit set for a 5xx status
+
+struct Slot { uint64_t hash = 0; const char* name = nullptr; uint32_t len = 0, id = 0; };
+
+// One worker's share of the file. Lines are bucketed by hour, whatever order they arrive in.
+struct Shard {
+    const char* begin; const char* end; const char* file_end;
+    std::vector<Slot> table = std::vector<Slot>(SLOTS);
+    std::vector<std::string_view> names;
+    std::vector<Rec> hours[HOURS];
+    std::vector<char> tail;  // zero-padded copy of the last lines, so the vector reads stay inside memory
 };
 
-struct Rec {
-    uint32_t gid;
-    uint32_t lat;
+static const char* scan_lines(Shard& s, const char* p, const char* end) {
+    while (p < end) {
+        const uint32_t hour = hour_index(p);
+        const char* ep = find_space(p + 28) + 1;
+        const char* sp = find_space(ep);
+        const size_t len = static_cast<size_t>(sp - ep);
+        const uint64_t h = hash_bytes(ep, len);
+        uint32_t idx = static_cast<uint32_t>(h) & (SLOTS - 1), id;
+        for (;;) {
+            Slot& slot = s.table[idx];
+            if (!slot.name) {
+                id = static_cast<uint32_t>(s.names.size());
+                slot = {h, ep, static_cast<uint32_t>(len), id};
+                s.names.emplace_back(ep, len);
+                break;
+            }
+            if (slot.hash == h && slot.len == len && std::memcmp(slot.name, ep, len) == 0) { id = slot.id; break; }
+            idx = (idx + 1) & (SLOTS - 1);
+        }
+        const char* q = sp + 5;
+        uint32_t latency = 0;
+        while (*q != '\n') latency = latency * 10u + static_cast<uint32_t>(*q++ - '0');
+        s.hours[hour].push_back({id | (static_cast<uint32_t>(sp[1] == '5') << 31), latency});
+        p = q + 1;
+    }
+    return p;
+}
+
+static void* scan_worker(void* arg) {
+    Shard& s = *static_cast<Shard*>(arg);
+    const size_t room = static_cast<size_t>(s.file_end - s.begin);
+    const char* stop = room > SAFE_TAIL ? std::min(s.end, s.file_end - SAFE_TAIL) : s.begin;
+    const char* p = scan_lines(s, s.begin, stop);
+    if (p < s.end) {
+        s.tail.assign(static_cast<size_t>(s.end - p) + SAFE_TAIL, 0);
+        std::memcpy(s.tail.data(), p, static_cast<size_t>(s.end - p));
+        scan_lines(s, s.tail.data(), s.tail.data() + (s.end - p));
+    }
+    return nullptr;
+}
+
+struct Merge {
+    std::vector<Shard>* shards;
+    std::vector<std::vector<uint32_t>> remap;  // shard endpoint id -> global endpoint id
+    std::vector<std::string_view> names;       // global endpoint id -> endpoint
+    std::vector<uint32_t> order;               // global ids in bytewise endpoint order
+    std::string out[HOURS];
+    std::atomic<unsigned> next{0};
 };
 
-// Binary search for first line whose hour index >= target_hid
-static const char* find_hour_binary(const char* begin, const char* finish, uint32_t target_hid) noexcept {
-    const char* low = begin;
-    const char* high = finish - 1;
-    const char* best = finish;
-    while (low <= high) {
-        const char* mid = low + (high - low) / 2;
-        const char* nl = static_cast<const char*>(std::memchr(mid, '\n', static_cast<size_t>(finish - mid)));
-        if (!nl || nl + 14 >= finish) {
-            high = mid - 1;
-            continue;
+static void emit_hour(Merge& m, unsigned hour, std::vector<uint32_t>& counts, std::vector<uint32_t>& errors,
+                      std::vector<uint32_t>& offsets, std::vector<uint32_t>& latencies) {
+    const size_t endpoints = m.names.size();
+    counts.assign(endpoints, 0); errors.assign(endpoints, 0);
+    size_t total = 0;
+    for (size_t w = 0; w < m.shards->size(); ++w) {
+        const uint32_t* remap = m.remap[w].data();
+        for (const Rec& r : (*m.shards)[w].hours[hour]) {
+            const uint32_t g = remap[r.key & 0x7fffffffu];
+            ++counts[g]; errors[g] += r.key >> 31;
         }
-        const char* line = nl + 1;
-        uint32_t hid = hour_to_idx(line);
-        if (hid >= target_hid) {
-            best = line;
-            high = mid - 1;
-        } else {
-            low = nl + 1;
-        }
+        total += (*m.shards)[w].hours[hour].size();
     }
-    return best;
+    if (!total) return;
+    offsets.assign(endpoints + 1, 0);
+    for (size_t g = 0; g < endpoints; ++g) offsets[g + 1] = offsets[g] + counts[g];
+    latencies.resize(total);
+    std::vector<uint32_t> fill(offsets.begin(), offsets.end() - 1);
+    for (size_t w = 0; w < m.shards->size(); ++w) {
+        const uint32_t* remap = m.remap[w].data();
+        for (const Rec& r : (*m.shards)[w].hours[hour]) latencies[fill[remap[r.key & 0x7fffffffu]]++] = r.lat;
+    }
+
+    std::string& out = m.out[hour];
+    out.reserve(endpoints * 64);
+    for (uint32_t g : m.order) {
+        const uint32_t count = counts[g];
+        if (!count) continue;
+        uint32_t* base = &latencies[offsets[g]];
+        const uint32_t r50 = (50u * count + 99u) / 100u - 1u;
+        const uint32_t r95 = (95u * count + 99u) / 100u - 1u;
+        const uint32_t r99 = (99u * count + 99u) / 100u - 1u;
+        if (count == 2) { if (base[1] < base[0]) std::swap(base[0], base[1]); }
+        else if (count <= 96) std::sort(base, base + count);
+        else {
+            std::nth_element(base, base + r50, base + count);
+            std::nth_element(base + r50 + 1, base + r95, base + count);
+            std::nth_element(base + r95 + 1, base + r99, base + count);
+        }
+        out.append(HOUR_STRINGS[hour]); out.append(":00:00Z "); out.append(m.names[g]); out.push_back(' ');
+        append_u64(out, count); out.push_back(' ');
+        append_u64(out, base[r50]); out.push_back(' ');
+        append_u64(out, base[r95]); out.push_back(' ');
+        append_u64(out, base[r99]); out.push_back(' ');
+        append_u64(out, errors[g]); out.push_back(' ');
+        append_u64(out, static_cast<uint64_t>(errors[g]) * 1000000ULL / count); out.push_back('\n');
+    }
+}
+
+static void* merge_worker(void* arg) {
+    Merge& m = *static_cast<Merge*>(arg);
+    std::vector<uint32_t> counts, errors, offsets, latencies;
+    for (unsigned hour; (hour = m.next.fetch_add(1)) < HOURS;) emit_hour(m, hour, counts, errors, offsets, latencies);
+    return nullptr;
+}
+
+template <class Fn> static void run_workers(Fn fn, void* const* args) {
+    pthread_attr_t attr; pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 524288);  // the default 8 MB of address space per thread is not needed
+    pthread_t threads[WORKERS];
+    for (unsigned w = 0; w < WORKERS; ++w) pthread_create(&threads[w], &attr, fn, args[w]);
+    pthread_attr_destroy(&attr);
+    for (unsigned w = 0; w < WORKERS; ++w) pthread_join(threads[w], nullptr);
 }
 
 int main() {
-    Mapping input("/data/requests.log");
-    const char *begin = input.data, *finish = input.data + input.size;
-    constexpr unsigned W = 12;
-
-    const char* worker_start[W];
-    const char* worker_end[W];
-
-    worker_start[0] = begin;
-    worker_end[W - 1] = finish;
-
-    // For each internal boundary w in 1..W-1, target hour is w * 6
-    for (unsigned w = 1; w < W; ++w) {
-        const uint32_t target_h = w * 6;
-        const char* probe = find_hour_binary(begin, finish, target_h);
-        // Margin: 3.5 MB before and after probe to guarantee capturing 100% of jittered lines
-        constexpr size_t MARGIN = 3500000;
-        const char* raw_start = (probe - begin > static_cast<ptrdiff_t>(MARGIN)) ? probe - MARGIN : begin;
-        const char* raw_end = (finish - probe > static_cast<ptrdiff_t>(MARGIN)) ? probe + MARGIN : finish;
-
-        // Align raw_start to next line
-        if (raw_start > begin) {
-            const char* nl = static_cast<const char*>(std::memchr(raw_start, '\n', static_cast<size_t>(finish - raw_start)));
-            worker_start[w] = nl ? nl + 1 : finish;
-        } else {
-            worker_start[w] = begin;
-        }
-
-        // Align raw_end to next line
-        if (raw_end < finish) {
-            const char* nl = static_cast<const char*>(std::memchr(raw_end, '\n', static_cast<size_t>(finish - raw_end)));
-            worker_end[w - 1] = nl ? nl + 1 : finish;
-        } else {
-            worker_end[w - 1] = finish;
-        }
-    }
-
-    std::vector<std::string> worker_outputs(W);
-
-    struct ThreadArg {
-        unsigned w;
-        uint32_t h_start;
-        uint32_t h_end;
-        const char* my_start;
-        const char* my_end;
-        std::string* out;
-    };
-
-    auto thread_worker = [](void* arg_ptr) -> void* {
-        ThreadArg* arg = static_cast<ThreadArg*>(arg_ptr);
-        const uint32_t h_start = arg->h_start;
-        const uint32_t h_end = arg->h_end;
-        const char* my_start = arg->my_start;
-        const char* my_end = arg->my_end;
-        std::string& out = *(arg->out);
-
-        FastMap map;
-        std::vector<std::string_view> ep_names; ep_names.reserve(2048);
-        constexpr size_t TOTAL_GROUPS = 6 * 2048;
-        std::vector<uint32_t> group_counts(TOTAL_GROUPS, 0);
-        std::vector<uint32_t> group_errs(TOTAL_GROUPS, 0);
-        std::vector<Rec> recs; recs.reserve(250000);
-
-        const char* p = my_start;
-        while (p < my_end) {
-            const char* line = p;
-            const char* nl = static_cast<const char*>(std::memchr(line, '\n', static_cast<size_t>(my_end - line)));
-            if (!nl) nl = my_end; p = nl < my_end ? nl + 1 : my_end;
-            if (nl - line < 35) continue;
-
-            uint32_t hid = hour_to_idx(line);
-            if (hid < h_start || hid >= h_end) continue;
-            uint32_t local_hid = hid - h_start;
-
-            const char* q = line + 27;
-            if (*q != ' ') { while (q < nl && *q != ' ') ++q; }
-            while (q < nl && *q == ' ') ++q;
-            while (q < nl && *q != ' ') ++q;
-            while (q < nl && *q == ' ') ++q;
-            const char* es = q;
-            while (q < nl && *q != ' ') ++q;
-            std::string_view ep_sv(es, static_cast<size_t>(q - es));
-
-            while (q < nl && *q == ' ') ++q;
-            const bool is_5xx = (*q == '5');
-            while (q < nl && *q != ' ') ++q;
-            while (q < nl && *q == ' ') ++q;
-            uint32_t lat = 0;
-            while (q < nl && *q >= '0' && *q <= '9') lat = lat * 10u + static_cast<uint32_t>(*q++ - '0');
-
-            int32_t eid = map.get_or_insert(ep_sv, static_cast<uint32_t>(ep_names.size()));
-            if (eid < 0) {
-                eid = static_cast<int32_t>(ep_names.size());
-                ep_names.push_back(ep_sv);
-            }
-            const uint32_t gid = local_hid * 2048u + static_cast<uint32_t>(eid);
-            group_counts[gid]++;
-            if (is_5xx) group_errs[gid]++;
-            recs.push_back({gid, lat});
-        }
-
-        std::vector<uint32_t> group_offsets(TOTAL_GROUPS + 1, 0);
-        for (size_t g = 0; g < TOTAL_GROUPS; ++g) group_offsets[g + 1] = group_offsets[g] + group_counts[g];
-        std::vector<uint32_t> write_pos = group_offsets;
-        std::vector<uint32_t> latencies(group_offsets.back());
-
-        for (const auto& r : recs) latencies[write_pos[r.gid]++] = r.lat;
-        recs.clear(); recs.shrink_to_fit();
-
-        out.reserve(6 * 1850 * 55);
-
-        for (uint32_t local_hid = 0; local_hid < 6; ++local_hid) {
-            const char* hstr = HOUR_STRINGS[h_start + local_hid];
-            const uint32_t g_base = local_hid * 2048u;
-            std::vector<uint32_t> active_eids; active_eids.reserve(ep_names.size());
-            for (uint32_t eid = 0; eid < ep_names.size(); ++eid) {
-                const uint32_t gid = g_base + eid;
-                if (group_counts[gid] > 0) active_eids.push_back(eid);
-            }
-            std::sort(active_eids.begin(), active_eids.end(), [&](uint32_t a, uint32_t b) {
-                return ep_names[a] < ep_names[b];
-            });
-
-            for (uint32_t eid : active_eids) {
-                const uint32_t gid = g_base + eid;
-                const uint32_t count = group_counts[gid];
-                uint32_t* base = &latencies[group_offsets[gid]];
-
-                if (count > 1) {
-                    if (count == 2) { if (base[1] < base[0]) std::swap(base[0], base[1]); }
-                    else if (count <= 96) { std::sort(base, base + count); }
-                    else {
-                        const uint32_t r50 = (50u * count + 99u) / 100u - 1u;
-                        const uint32_t r95 = (95u * count + 99u) / 100u - 1u;
-                        const uint32_t r99 = (99u * count + 99u) / 100u - 1u;
-                        std::nth_element(base, base + r50, base + count);
-                        std::nth_element(base + r50 + 1, base + r95, base + count);
-                        std::nth_element(base + r95 + 1, base + r99, base + count);
-                    }
-                }
-
-                out.append(hstr); out.append(":00:00Z "); out.append(ep_names[eid]); out.push_back(' ');
-                append_u64(out, count); out.push_back(' ');
-                append_u64(out, base[(50u * count + 99u) / 100u - 1u]); out.push_back(' ');
-                append_u64(out, base[(95u * count + 99u) / 100u - 1u]); out.push_back(' ');
-                append_u64(out, base[(99u * count + 99u) / 100u - 1u]); out.push_back(' ');
-                const uint32_t errs = group_errs[gid];
-                append_u64(out, errs); out.push_back(' ');
-                append_u64(out, static_cast<uint64_t>(errs) * 1000000ULL / count); out.push_back('\n');
-            }
-        }
-        return nullptr;
-    };
-
-    pthread_t threads[W];
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    // Explicit 512 KB stack size to avoid default 8 MB virtual memory per thread
-    pthread_attr_setstacksize(&attr, 524288);
-
-    ThreadArg args[W];
-    for (unsigned w = 0; w < W; ++w) {
-        args[w] = {w, w * 6, (w + 1) * 6, worker_start[w], worker_end[w], &worker_outputs[w]};
-        pthread_create(&threads[w], &attr, thread_worker, &args[w]);
-    }
-    pthread_attr_destroy(&attr);
-
-    for (unsigned w = 0; w < W; ++w) {
-        pthread_join(threads[w], nullptr);
-    }
-
+    const int fd = open("/data/requests.log", O_RDONLY);
+    struct stat st{};
+    if (fd < 0 || fstat(fd, &st) != 0) _exit(2);
+    const size_t size = static_cast<size_t>(st.st_size);
     const int out_fd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out_fd >= 0) {
-        for (unsigned w = 0; w < W; ++w) {
-            const char* wp = worker_outputs[w].data(); size_t rem = worker_outputs[w].size();
-            while (rem) { ssize_t s = write(out_fd, wp, rem); if (s <= 0) break; wp += s; rem -= static_cast<size_t>(s); }
-        }
-        close(out_fd);
+    if (out_fd < 0) _exit(3);
+    if (!size) return 0;
+    const char* data = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0));
+    if (data == MAP_FAILED) _exit(2);
+
+    // Equal byte ranges moved forward to the next line start. Nothing here assumes the file is in time order.
+    std::vector<Shard> shards(WORKERS);
+    const char* cut[WORKERS + 1];
+    cut[0] = data; cut[WORKERS] = data + size;
+    for (unsigned w = 1; w < WORKERS; ++w) {
+        const char* from = data + size * w / WORKERS - 1;
+        const char* nl = static_cast<const char*>(std::memchr(from, '\n', static_cast<size_t>(data + size - from)));
+        cut[w] = nl ? nl + 1 : data + size;
     }
+    void* args[WORKERS];
+    for (unsigned w = 0; w < WORKERS; ++w) {
+        shards[w].begin = cut[w]; shards[w].end = cut[w + 1]; shards[w].file_end = data + size;
+        args[w] = &shards[w];
+    }
+    run_workers(scan_worker, args);
+
+    Merge m; m.shards = &shards;
+    std::vector<Slot> global(SLOTS * 2);
+    m.remap.resize(WORKERS);
+    for (unsigned w = 0; w < WORKERS; ++w) {
+        for (std::string_view name : shards[w].names) {
+            const uint64_t h = hash_bytes(name.data(), name.size());
+            uint32_t idx = static_cast<uint32_t>(h) & (SLOTS * 2 - 1), id;
+            for (;;) {
+                Slot& slot = global[idx];
+                if (!slot.name) {
+                    id = static_cast<uint32_t>(m.names.size());
+                    slot = {h, name.data(), static_cast<uint32_t>(name.size()), id};
+                    m.names.push_back(name);
+                    break;
+                }
+                if (slot.hash == h && slot.len == name.size() && std::memcmp(slot.name, name.data(), name.size()) == 0) { id = slot.id; break; }
+                idx = (idx + 1) & (SLOTS * 2 - 1);
+            }
+            m.remap[w].push_back(id);
+        }
+    }
+    m.order.resize(m.names.size());
+    for (uint32_t g = 0; g < m.order.size(); ++g) m.order[g] = g;
+    std::sort(m.order.begin(), m.order.end(), [&](uint32_t a, uint32_t b) { return m.names[a] < m.names[b]; });
+
+    void* margs[WORKERS];
+    for (unsigned w = 0; w < WORKERS; ++w) margs[w] = &m;
+    run_workers(merge_worker, margs);
+
+    for (const std::string& hour_out : m.out) {
+        const char* wp = hour_out.data(); size_t rem = hour_out.size();
+        while (rem) { ssize_t s = write(out_fd, wp, rem); if (s <= 0) _exit(3); wp += s; rem -= static_cast<size_t>(s); }
+    }
+    close(out_fd);
     return 0;
 }
