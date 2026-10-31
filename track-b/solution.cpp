@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <fcntl.h>
 #include <limits>
 #include <pthread.h>
@@ -205,52 +207,52 @@ static inline bool phrase_anchored(const char* doc_start, const char* doc_end, c
     if (phrase_len == 0) return true;
     const std::string& anc = phrase[anchor_idx];
     const size_t anc_len = anc.size();
-    const char anc_lower = static_cast<char>(TO_LOWER[static_cast<unsigned char>(anc[0])]);
-    const char anc_upper = static_cast<char>((anc_lower >= 'a' && anc_lower <= 'z') ? (anc_lower - 32) : anc_lower);
+    const auto is_tok = [](char c) { return IS_TOKEN[static_cast<unsigned char>(c)] != 0; };
+    const auto word_eq = [](const char* s, size_t n, const std::string& w) {
+        return n == w.size() && eq_ignore_case(s, w.data(), n);
+    };
 
-    const char* p = doc_start;
-    while (p < doc_end) {
-        while (p < doc_end && !IS_TOKEN[static_cast<unsigned char>(*p)]) ++p;
-        if (p >= doc_end) break;
-        char c = *p;
-        if (c != anc_lower && c != anc_upper) {
-            while (p < doc_end && IS_TOKEN[static_cast<unsigned char>(*p)]) ++p;
-            continue;
+    // The anchor word sits at [w_start, w_end) as a whole token; check the words around it.
+    const auto around = [&](const char* w_start, const char* w_end) {
+        const char* q = w_start;
+        for (int k = static_cast<int>(anchor_idx) - 1; k >= 0; --k) {
+            while (q > doc_start && !is_tok(q[-1])) --q;
+            if (q <= doc_start) return false;
+            const char* prev_end = q;
+            while (q > doc_start && is_tok(q[-1])) --q;
+            if (!word_eq(q, static_cast<size_t>(prev_end - q), phrase[static_cast<size_t>(k)])) return false;
         }
-        const char* w_start = p;
-        while (p < doc_end && IS_TOKEN[static_cast<unsigned char>(*p)]) ++p;
-        const size_t w_len = static_cast<size_t>(p - w_start);
-        if (w_len == anc_len && eq_ignore_case(w_start, anc.data(), w_len)) {
-            bool left_ok = true;
-            const char* q = w_start;
-            for (int k = static_cast<int>(anchor_idx) - 1; k >= 0; --k) {
-                while (q > doc_start && !IS_TOKEN[static_cast<unsigned char>(q[-1])]) --q;
-                if (q <= doc_start) { left_ok = false; break; }
-                const char* prev_end = q;
-                while (q > doc_start && IS_TOKEN[static_cast<unsigned char>(q[-1])]) --q;
-                const char* prev_start = q;
-                const size_t prev_len = static_cast<size_t>(prev_end - prev_start);
-                if (prev_len != phrase[k].size() || !eq_ignore_case(prev_start, phrase[k].data(), prev_len)) {
-                    left_ok = false; break;
-                }
-            }
-            if (!left_ok) continue;
+        const char* cur = w_end;
+        for (size_t k = anchor_idx + 1; k < phrase_len; ++k) {
+            while (cur < doc_end && !is_tok(*cur)) ++cur;
+            if (cur >= doc_end) return false;
+            const char* next_start = cur;
+            while (cur < doc_end && is_tok(*cur)) ++cur;
+            if (!word_eq(next_start, static_cast<size_t>(cur - next_start), phrase[k])) return false;
+        }
+        return true;
+    };
+    const auto at = [&](const char* s) {
+        if (static_cast<size_t>(doc_end - s) < anc_len || !eq_ignore_case(s, anc.data(), anc_len)) return false;
+        if (s > doc_start && is_tok(s[-1])) return false;
+        if (s + anc_len < doc_end && is_tok(s[anc_len])) return false;
+        return around(s, s + anc_len);
+    };
 
-            bool right_ok = true;
-            const char* cur = p;
-            for (size_t k = anchor_idx + 1; k < phrase_len; ++k) {
-                while (cur < doc_end && !IS_TOKEN[static_cast<unsigned char>(*cur)]) ++cur;
-                if (cur >= doc_end) { right_ok = false; break; }
-                const char* next_start = cur;
-                while (cur < doc_end && IS_TOKEN[static_cast<unsigned char>(*cur)]) ++cur;
-                const size_t next_len = static_cast<size_t>(cur - next_start);
-                if (next_len != phrase[k].size() || !eq_ignore_case(next_start, phrase[k].data(), next_len)) {
-                    right_ok = false; break;
-                }
-            }
-            if (right_ok) return true;
+    // Vector pass: flag every offset whose first two bytes match the anchor (either case), then verify exactly.
+    const bool two = anc_len >= 2;
+    const __m256i c20 = _mm256_set1_epi8(0x20);
+    const __m256i b0 = _mm256_set1_epi8(static_cast<char>(TO_LOWER[static_cast<unsigned char>(anc[0])] | 0x20));
+    const __m256i b1 = _mm256_set1_epi8(static_cast<char>(two ? (TO_LOWER[static_cast<unsigned char>(anc[1])] | 0x20) : 0));
+    const char* s = doc_start;
+    for (; s + 33 <= doc_end; s += 32) {
+        __m256i m = _mm256_cmpeq_epi8(_mm256_or_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s)), c20), b0);
+        if (two) m = _mm256_and_si256(m, _mm256_cmpeq_epi8(_mm256_or_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 1)), c20), b1));
+        for (uint32_t bits = static_cast<uint32_t>(_mm256_movemask_epi8(m)); bits; bits &= bits - 1) {
+            if (at(s + __builtin_ctz(bits))) return true;
         }
     }
+    for (; s < doc_end; ++s) if (at(s)) return true;
     return false;
 }
 
@@ -474,7 +476,8 @@ int main() {
     std::vector<uint32_t> term_offsets(term_count + 1, 0);
     for (size_t t = 0; t < term_count; ++t) term_offsets[t + 1] = term_offsets[t] + term_total[t];
 
-    std::vector<uint32_t> flat_postings(term_offsets[term_count]);
+    // Left uninitialised: pass 2 writes every slot, and its threads take the page faults in parallel.
+    std::unique_ptr<uint32_t[]> flat_postings(new uint32_t[term_offsets[term_count]]);
     std::vector<std::vector<uint32_t>> worker_write_pos(workers, std::vector<uint32_t>(term_count));
     for (size_t t = 0; t < term_count; ++t) {
         uint32_t cur = term_offsets[t];
@@ -500,13 +503,15 @@ int main() {
         const auto& my_tokens = *(ctx->my_tokens);
         const auto& my_counts = *(ctx->my_counts);
         uint32_t* flat_postings = ctx->flat_postings;
-        uint32_t tok_idx = 0;
+        const size_t ntok = my_tokens.size();
+        size_t tok_idx = 0;
 
         for (uint32_t cur_doc = first; cur_doc < last; ++cur_doc) {
             const uint16_t num = my_counts[cur_doc - first];
-            for (uint16_t k = 0; k < num; ++k) {
-                uint32_t tid = my_tokens[tok_idx++];
-                flat_postings[my_pos[tid]++] = cur_doc;
+            for (uint16_t k = 0; k < num; ++k, ++tok_idx) {
+                if (tok_idx + 16 < ntok) __builtin_prefetch(&my_pos[my_tokens[tok_idx + 16]], 1);
+                if (tok_idx + 8 < ntok) __builtin_prefetch(&flat_postings[my_pos[my_tokens[tok_idx + 8]]], 1);
+                flat_postings[my_pos[my_tokens[tok_idx]]++] = cur_doc;
             }
         }
         return nullptr;
@@ -514,7 +519,7 @@ int main() {
 
     Pass2Context p2_contexts[workers];
     for (unsigned w = 0; w < workers; ++w) {
-        p2_contexts[w] = {doc_start[w], doc_start[w + 1], &worker_write_pos[w], &worker_tokens[w], &worker_doc_tok_count[w], flat_postings.data()};
+        p2_contexts[w] = {doc_start[w], doc_start[w + 1], &worker_write_pos[w], &worker_tokens[w], &worker_doc_tok_count[w], flat_postings.get()};
         pthread_create(&threads[w], &attr, pass2_worker, &p2_contexts[w]);
     }
     for (unsigned w = 0; w < workers; ++w) pthread_join(threads[w], nullptr);
@@ -531,14 +536,34 @@ int main() {
     // cache-friendly word operations. Sparse terms keep their compact postings.
     const uint32_t bitmap_words = (total_docs + 63) >> 6;
     std::vector<int32_t> dense_index(term_count, -1);
-    std::vector<uint64_t> dense_bits;
+    std::vector<uint32_t> dense_terms;
     for (uint32_t term = 0; term < term_count; ++term) {
         if (term_total[term] <= 4096) continue;
-        dense_index[term] = static_cast<int32_t>(dense_bits.size() / bitmap_words);
-        const size_t base = dense_bits.size(); dense_bits.resize(base + bitmap_words, 0);
-        const uint32_t* ids = flat_postings.data() + term_offsets[term];
-        for (uint32_t i = 0; i < term_total[term]; ++i) dense_bits[base + (ids[i] >> 6)] |= 1ULL << (ids[i] & 63);
+        dense_index[term] = static_cast<int32_t>(dense_terms.size());
+        dense_terms.push_back(term);
     }
+    // calloc hands back lazily zeroed pages, so the build threads below also take the zero-fill faults.
+    uint64_t* const dense_bits = static_cast<uint64_t*>(std::calloc(dense_terms.size() * bitmap_words + 1, sizeof(uint64_t)));
+    struct DenseContext {
+        unsigned w; const std::vector<uint32_t>* terms; const uint32_t* postings; const uint32_t* offsets;
+        const uint32_t* totals; uint64_t* bits; uint32_t words;
+    };
+    auto dense_worker = [](void* arg_ptr) -> void* {
+        const DenseContext* c = static_cast<const DenseContext*>(arg_ptr);
+        for (size_t i = c->w; i < c->terms->size(); i += workers) {
+            const uint32_t term = (*c->terms)[i];
+            uint64_t* dst = c->bits + i * c->words;
+            const uint32_t* ids = c->postings + c->offsets[term];
+            for (uint32_t j = 0; j < c->totals[term]; ++j) dst[ids[j] >> 6] |= 1ULL << (ids[j] & 63);
+        }
+        return nullptr;
+    };
+    DenseContext d_contexts[workers];
+    for (unsigned w = 0; w < workers; ++w) {
+        d_contexts[w] = {w, &dense_terms, flat_postings.get(), term_offsets.data(), term_total.data(), dense_bits, bitmap_words};
+        pthread_create(&threads[w], &attr, dense_worker, &d_contexts[w]);
+    }
+    for (unsigned w = 0; w < workers; ++w) pthread_join(threads[w], nullptr);
 
     std::vector<std::string> local_out(workers);
 
@@ -694,7 +719,7 @@ int main() {
 
     QueryContext q_contexts[workers];
     for (unsigned w = 0; w < workers; ++w) {
-        q_contexts[w] = {w, queries.size() * w / workers, queries.size() * (w + 1) / workers, &queries, documents.data(), flat_postings.data(), term_offsets.data(), term_total.data(), term_count, dense_index.data(), dense_bits.data(), bitmap_words, &local_out[w]};
+        q_contexts[w] = {w, queries.size() * w / workers, queries.size() * (w + 1) / workers, &queries, documents.data(), flat_postings.get(), term_offsets.data(), term_total.data(), term_count, dense_index.data(), dense_bits, bitmap_words, &local_out[w]};
         pthread_create(&threads[w], &attr, query_worker, &q_contexts[w]);
     }
     for (unsigned w = 0; w < workers; ++w) pthread_join(threads[w], nullptr);
