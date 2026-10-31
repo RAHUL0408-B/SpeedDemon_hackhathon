@@ -4,6 +4,7 @@
 #include <atomic>
 #include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
@@ -69,6 +70,29 @@ static inline void append_u64(std::string& out, uint64_t n) {
 
 struct Rec { uint32_t key, lat; };  // key: the shard's endpoint id, top bit set for a 5xx status
 
+// An append-only list of records in fixed blocks: no reallocation, no copying, and at most one part-filled block.
+struct Bucket {
+    static constexpr size_t BLOCK = 1024;
+    std::vector<Rec*> blocks;
+    Rec* next = nullptr;
+    Rec* limit = nullptr;
+    void push(Rec r) {
+        if (next == limit) {
+            next = static_cast<Rec*>(std::malloc(BLOCK * sizeof(Rec)));
+            blocks.push_back(next);
+            limit = next + BLOCK;
+        }
+        *next++ = r;
+    }
+    size_t size() const { return blocks.size() * BLOCK - static_cast<size_t>(limit - next); }
+    template <class F> void each(F&& f) const {
+        for (size_t b = 0; b < blocks.size(); ++b) {
+            const size_t n = b + 1 == blocks.size() ? BLOCK - static_cast<size_t>(limit - next) : BLOCK;
+            for (size_t i = 0; i < n; ++i) f(blocks[b][i]);
+        }
+    }
+};
+
 struct Slot { uint64_t hash = 0; const char* name = nullptr; uint32_t len = 0, id = 0; };
 
 // One worker's share of the file. Lines are bucketed by hour, whatever order they arrive in.
@@ -76,7 +100,7 @@ struct Shard {
     const char* begin; const char* end; const char* file_end;
     std::vector<Slot> table = std::vector<Slot>(SLOTS);
     std::vector<std::string_view> names;
-    std::vector<Rec> hours[HOURS];
+    Bucket hours[HOURS];
     std::vector<char> tail;  // zero-padded copy of the last lines, so the vector reads stay inside memory
 };
 
@@ -123,7 +147,7 @@ static const char* scan_lines(Shard& s, const char* p, const char* end) {
         }
         uint32_t latency;
         p = parse_latency(sp + 5, latency);
-        s.hours[hour].push_back({id | (static_cast<uint32_t>(sp[1] == '5') << 31), latency});
+        s.hours[hour].push({id | (static_cast<uint32_t>(sp[1] == '5') << 31), latency});
     }
     return p;
 }
@@ -157,10 +181,10 @@ static void emit_hour(Merge& m, unsigned hour, std::vector<uint32_t>& counts, st
     size_t total = 0;
     for (size_t w = 0; w < m.shards->size(); ++w) {
         const uint32_t* remap = m.remap[w].data();
-        for (const Rec& r : (*m.shards)[w].hours[hour]) {
+        (*m.shards)[w].hours[hour].each([&](const Rec& r) {
             const uint32_t g = remap[r.key & 0x7fffffffu];
             ++counts[g]; errors[g] += r.key >> 31;
-        }
+        });
         total += (*m.shards)[w].hours[hour].size();
     }
     if (!total) return;
@@ -170,7 +194,7 @@ static void emit_hour(Merge& m, unsigned hour, std::vector<uint32_t>& counts, st
     std::vector<uint32_t> fill(offsets.begin(), offsets.end() - 1);
     for (size_t w = 0; w < m.shards->size(); ++w) {
         const uint32_t* remap = m.remap[w].data();
-        for (const Rec& r : (*m.shards)[w].hours[hour]) latencies[fill[remap[r.key & 0x7fffffffu]]++] = r.lat;
+        (*m.shards)[w].hours[hour].each([&](const Rec& r) { latencies[fill[remap[r.key & 0x7fffffffu]]++] = r.lat; });
     }
 
     std::string& out = m.out[hour];
