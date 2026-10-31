@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <immintrin.h>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -23,16 +24,27 @@ struct Mapping {
         if (fd < 0 || fstat(fd, &st) != 0) _exit(2);
         size = static_cast<size_t>(st.st_size);
         if (size) {
-            data = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0));
-            if (data == MAP_FAILED) _exit(2);
+            // Two spare zero pages follow the file, so the eight-byte and 32-byte reads at its end stay in bounds.
+            void* base = mmap(nullptr, size + 8192, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (base == MAP_FAILED || mmap(base, size, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) _exit(2);
+            data = static_cast<const char*>(base);
             madvise(const_cast<char*>(data), size, MADV_SEQUENTIAL);
         }
     }
-    ~Mapping() { if (data && data != MAP_FAILED) munmap(const_cast<char*>(data), size); if (fd >= 0) close(fd); }
+    ~Mapping() { if (data) munmap(const_cast<char*>(data), size + 8192); if (fd >= 0) close(fd); }
 };
 
 // begin..end is the raw text between the delimiting quotes (or the unquoted bytes); pairs counts the "" inside it.
 struct Field { const char* begin; const char* end; size_t pairs; bool quoted; };
+
+static inline const char* find_quote(const char* p, const char* lim) noexcept {
+    const __m256i quote = _mm256_set1_epi8('"');
+    for (; p + 32 <= lim; p += 32) {
+        const uint32_t m = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)), quote)));
+        if (m) return p + __builtin_ctz(m);
+    }
+    return static_cast<const char*>(std::memchr(p, '"', static_cast<size_t>(lim - p)));
+}
 
 static inline Field read_field(const char*& p, const char* lim) noexcept {
     if (*p != '"') {
@@ -43,25 +55,43 @@ static inline Field read_field(const char*& p, const char* lim) noexcept {
     const char* b = ++p;
     size_t pairs = 0;
     for (;;) {
-        const char* q = static_cast<const char*>(std::memchr(p, '"', static_cast<size_t>(lim - p)));
+        const char* q = find_quote(p, lim);
         if (q[1] == '"') { ++pairs; p = q + 2; continue; }
         p = q + 1;
         return {b, q, pairs, true};
     }
 }
 
+// Value of eight decimal digits held as bytes 0..9, first digit in the lowest byte.
+static inline uint32_t digits8(uint64_t w) noexcept {
+    w = ((w & 0x0F0F0F0F0F0F0F0FULL) * 2561) >> 8;
+    w = ((w & 0x00FF00FF00FF00FFULL) * 6553601) >> 16;
+    return static_cast<uint32_t>(((w & 0x0000FFFF0000FFFFULL) * 42949672960001ULL) >> 32);
+}
+
+// Reads a run of decimal digits and leaves p on the byte after it. XOR with '0' turns digits into 0..9 and
+// every delimiter (comma, dot, CR, LF) into a value above 9, so one mask finds where the number ends.
 static inline uint32_t read_uint32(const char*& p) noexcept {
-    uint32_t n = 0;
-    while (*p >= '0' && *p <= '9') n = n * 10u + static_cast<uint32_t>(*p++ - '0');
+    uint64_t w; std::memcpy(&w, p, 8);
+    w ^= 0x3030303030303030ULL;
+    const uint64_t stop = ((w + 0x7676767676767676ULL) | w) & 0x8080808080808080ULL;
+    if (stop) {
+        const unsigned digits = static_cast<unsigned>(__builtin_ctzll(stop)) >> 3;
+        if (!digits) return 0;
+        p += digits;
+        return digits8(w << ((8 - digits) * 8));
+    }
+    uint32_t n = digits8(w);
+    for (p += 8; *p >= '0' && *p <= '9'; ++p) n = n * 10u + static_cast<uint32_t>(*p - '0');
     return n;
 }
 
 static inline int64_t read_cents(const char*& p) noexcept {
-    bool neg = (*p == '-'); if (neg) ++p;
-    int64_t whole = 0;
-    while (*p != '.') whole = whole * 10 + (*p++ - '0');
+    const bool neg = (*p == '-'); if (neg) ++p;
+    const int64_t whole = read_uint32(p);
     ++p;
-    int64_t cents = whole * 100 + int64_t(*p++ - '0') * 10 + int64_t(*p++ - '0');
+    const int64_t cents = whole * 100 + int64_t(p[0] - '0') * 10 + int64_t(p[1] - '0');
+    p += 2;
     return neg ? -cents : cents;
 }
 
