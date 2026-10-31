@@ -137,10 +137,13 @@ static inline int lookup_term(const char* p, size_t len, uint64_t h) noexcept {
 }
 
 static uint32_t insert_term(std::string_view word) {
-    std::string padded; padded.reserve(word.size() + 8);
-    for (char c : word) padded.push_back(static_cast<char>(TO_LOWER[static_cast<unsigned char>(c)]));
-    padded.append(8, '\0');
-    const uint64_t h = hash_token(padded.data(), word.size());
+    char stack_buf[72];
+    std::string heap_buf;
+    char* padded = stack_buf;
+    if (word.size() > 64) { heap_buf.resize(word.size() + 8); padded = heap_buf.data(); }
+    for (size_t i = 0; i < word.size(); ++i) padded[i] = static_cast<char>(TO_LOWER[static_cast<unsigned char>(word[i])]);
+    std::memset(padded + word.size(), 0, 8);
+    const uint64_t h = hash_token(padded, word.size());
     bloom_add(h);
     uint32_t idx = static_cast<uint32_t>(h) & TABLE_MASK;
     while (term_table[idx].hash != 0) {
@@ -162,7 +165,7 @@ struct Document { const char* begin; const char* end; };
 struct Query {
     bool phrase = false;
     std::vector<uint32_t> terms;
-    std::vector<std::string> phrase_words;
+    std::vector<std::string_view> phrase_words;
     std::vector<uint8_t> ops;
 };
 
@@ -183,7 +186,7 @@ static Query parse_query(std::string_view line) {
             size_t e = s.find(' ', b); if (e == std::string_view::npos) e = s.size();
             std::string_view w = s.substr(b, e - b);
             q.terms.push_back(insert_term(w));
-            q.phrase_words.emplace_back(w);
+            q.phrase_words.push_back(w);
             b = e + 1;
         }
         return q;
@@ -202,13 +205,13 @@ static Query parse_query(std::string_view line) {
     return q;
 }
 
-static inline bool phrase_anchored(const char* doc_start, const char* doc_end, const std::vector<std::string>& phrase, size_t anchor_idx) noexcept {
+static inline bool phrase_anchored(const char* doc_start, const char* doc_end, const std::vector<std::string_view>& phrase, size_t anchor_idx) noexcept {
     const size_t phrase_len = phrase.size();
     if (phrase_len == 0) return true;
-    const std::string& anc = phrase[anchor_idx];
+    const std::string_view anc = phrase[anchor_idx];
     const size_t anc_len = anc.size();
     const auto is_tok = [](char c) { return IS_TOKEN[static_cast<unsigned char>(c)] != 0; };
-    const auto word_eq = [](const char* s, size_t n, const std::string& w) {
+    const auto word_eq = [](const char* s, size_t n, std::string_view w) {
         return n == w.size() && eq_ignore_case(s, w.data(), n);
     };
 
