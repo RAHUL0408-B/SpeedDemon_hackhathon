@@ -563,6 +563,14 @@ int main() {
                 }
             } else {
                 auto [p0, len0] = get_postings_local(q.terms[0]);
+                if (q.ops.empty()) {
+                    qr.count = static_cast<uint32_t>(len0);
+                    qr.num10 = static_cast<uint8_t>(std::min<size_t>(len0, 10));
+                    for (size_t i = 0; i < len0; ++i) qr.sum += p0[i];
+                    for (size_t i = 0; i < qr.num10; ++i) qr.first10[i] = p0[i];
+                    append_result(out, qr);
+                    continue;
+                }
                 bool dense = ctx->dense_index[q.terms[0]] >= 0;
                 if (dense) {
                     const uint64_t* src = ctx->dense_bits + static_cast<size_t>(ctx->dense_index[q.terms[0]]) * ctx->bitmap_words;
