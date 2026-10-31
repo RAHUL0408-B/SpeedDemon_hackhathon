@@ -68,7 +68,8 @@ static inline void append_u64(std::string& out, uint64_t n) {
     char buf[24]; auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), n); out.append(buf, p);
 }
 
-struct Rec { uint32_t key, lat; };  // key: the shard's endpoint id, top bit set for a 5xx status
+// Six bytes per request. key: the shard's endpoint id (below 4096), bit 15 set for a 5xx status.
+struct __attribute__((packed)) Rec { uint32_t lat; uint16_t key; };
 
 // An append-only list of records in fixed blocks: no reallocation, no copying, and at most one part-filled block.
 struct Bucket {
@@ -147,7 +148,7 @@ static const char* scan_lines(Shard& s, const char* p, const char* end) {
         }
         uint32_t latency;
         p = parse_latency(sp + 5, latency);
-        s.hours[hour].push({id | (static_cast<uint32_t>(sp[1] == '5') << 31), latency});
+        s.hours[hour].push({latency, static_cast<uint16_t>(id | (static_cast<uint32_t>(sp[1] == '5') << 15))});
     }
     return p;
 }
@@ -172,6 +173,7 @@ struct Merge {
     std::vector<uint32_t> order;               // global ids in bytewise endpoint order
     std::string out[HOURS];
     std::atomic<unsigned> next{0};
+    std::atomic<bool> ready[HOURS];  // set once out[hour] is final, so the main thread can write it out
 };
 
 static void emit_hour(Merge& m, unsigned hour, std::vector<uint32_t>& counts, std::vector<uint32_t>& errors,
@@ -182,8 +184,8 @@ static void emit_hour(Merge& m, unsigned hour, std::vector<uint32_t>& counts, st
     for (size_t w = 0; w < m.shards->size(); ++w) {
         const uint32_t* remap = m.remap[w].data();
         (*m.shards)[w].hours[hour].each([&](const Rec& r) {
-            const uint32_t g = remap[r.key & 0x7fffffffu];
-            ++counts[g]; errors[g] += r.key >> 31;
+            const uint32_t g = remap[r.key & 0x7fffu];
+            ++counts[g]; errors[g] += r.key >> 15;
         });
         total += (*m.shards)[w].hours[hour].size();
     }
@@ -194,7 +196,7 @@ static void emit_hour(Merge& m, unsigned hour, std::vector<uint32_t>& counts, st
     std::vector<uint32_t> fill(offsets.begin(), offsets.end() - 1);
     for (size_t w = 0; w < m.shards->size(); ++w) {
         const uint32_t* remap = m.remap[w].data();
-        (*m.shards)[w].hours[hour].each([&](const Rec& r) { latencies[fill[remap[r.key & 0x7fffffffu]]++] = r.lat; });
+        (*m.shards)[w].hours[hour].each([&](const Rec& r) { latencies[fill[remap[r.key & 0x7fffu]]++] = r.lat; });
     }
 
     std::string& out = m.out[hour];
@@ -226,16 +228,21 @@ static void emit_hour(Merge& m, unsigned hour, std::vector<uint32_t>& counts, st
 static void* merge_worker(void* arg) {
     Merge& m = *static_cast<Merge*>(arg);
     std::vector<uint32_t> counts, errors, offsets, latencies;
-    for (unsigned hour; (hour = m.next.fetch_add(1)) < HOURS;) emit_hour(m, hour, counts, errors, offsets, latencies);
+    for (unsigned hour; (hour = m.next.fetch_add(1)) < HOURS;) {
+        emit_hour(m, hour, counts, errors, offsets, latencies);
+        m.ready[hour].store(true, std::memory_order_release);
+    }
     return nullptr;
 }
 
-template <class Fn> static void run_workers(Fn fn, void* const* args) {
+// Starts one thread per worker, runs `meanwhile` on the calling thread, then waits for them all.
+template <class Fn, class Meanwhile> static void run_workers(Fn fn, void* const* args, Meanwhile meanwhile) {
     pthread_attr_t attr; pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 524288);  // the default 8 MB of address space per thread is not needed
     pthread_t threads[WORKERS];
     for (unsigned w = 0; w < WORKERS; ++w) pthread_create(&threads[w], &attr, fn, args[w]);
     pthread_attr_destroy(&attr);
+    meanwhile();
     for (unsigned w = 0; w < WORKERS; ++w) pthread_join(threads[w], nullptr);
 }
 
@@ -264,7 +271,7 @@ int main() {
         shards[w].begin = cut[w]; shards[w].end = cut[w + 1]; shards[w].file_end = data + size;
         args[w] = &shards[w];
     }
-    run_workers(scan_worker, args);
+    run_workers(scan_worker, args, [] {});
 
     Merge m; m.shards = &shards;
     std::vector<Slot> global(SLOTS * 2);
@@ -293,12 +300,16 @@ int main() {
 
     void* margs[WORKERS];
     for (unsigned w = 0; w < WORKERS; ++w) margs[w] = &m;
-    run_workers(merge_worker, margs);
-
-    for (const std::string& hour_out : m.out) {
-        const char* wp = hour_out.data(); size_t rem = hour_out.size();
-        while (rem) { ssize_t s = write(out_fd, wp, rem); if (s <= 0) _exit(3); wp += s; rem -= static_cast<size_t>(s); }
-    }
+    // Hours are written in order as soon as they are ready, which overlaps the output with the remaining merging
+    // and means only a few hours of text are ever held at once.
+    run_workers(merge_worker, margs, [&] {
+        for (unsigned hour = 0; hour < HOURS; ++hour) {
+            while (!m.ready[hour].load(std::memory_order_acquire)) usleep(50);
+            const char* wp = m.out[hour].data(); size_t rem = m.out[hour].size();
+            while (rem) { ssize_t s = write(out_fd, wp, rem); if (s <= 0) _exit(3); wp += s; rem -= static_cast<size_t>(s); }
+            std::string().swap(m.out[hour]);
+        }
+    });
     close(out_fd);
     return 0;
 }
