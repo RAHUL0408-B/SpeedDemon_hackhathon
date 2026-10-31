@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include <immintrin.h>
 
 struct Mapping {
     int fd = -1; size_t size = 0; const char* data = nullptr;
@@ -24,7 +25,6 @@ struct Mapping {
         if (size) {
             data = static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0));
             if (data == MAP_FAILED) _exit(2);
-            madvise(const_cast<char*>(data), size, MADV_SEQUENTIAL);
         }
     }
     ~Mapping() { if (data && data != MAP_FAILED) munmap(const_cast<char*>(data), size); if (fd >= 0) close(fd); }
@@ -47,13 +47,50 @@ static inline bool eq_ignore_case(const char* p, const char* word, size_t len) n
     return true;
 }
 
-static inline uint64_t fnv1a_case(const char* p, size_t len) noexcept {
-    uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= TO_LOWER[static_cast<unsigned char>(p[i])];
-        h *= 1099511628211ULL;
+static inline uint64_t fold(uint64_t h, uint64_t w) noexcept {
+    h = (h ^ w) * 0x9E3779B97F4A7C15ULL;
+    return h ^ (h >> 32);
+}
+
+// Hash of an alphanumeric token, case-folded with OR 0x20 (exact for [A-Za-z0-9]), eight bytes per step.
+// Tokens up to 8 bytes map one-to-one onto their hash. Reads up to 7 bytes past the token.
+static inline uint64_t hash_token(const char* p, size_t len) noexcept {
+    uint64_t h = 0x243F6A8885A308D3ULL;
+    for (;;) {
+        uint64_t w; std::memcpy(&w, p, 8);
+        const uint64_t keep = len >= 8 ? ~0ULL : ((1ULL << (len * 8)) - 1);
+        h = fold(h, (w | 0x2020202020202020ULL) & keep);
+        if (len <= 8) return h ? h : 1;
+        p += 8; len -= 8;
     }
-    return h == 0 ? 1 : h;
+}
+
+// Calls emit(start, len) for each maximal [A-Za-z0-9] run in [b, e), 32 bytes at a time.
+// Reads up to 31 bytes past e.
+template <class F> static inline void scan_tokens(const char* b, const char* e, F&& emit) {
+    const __m256i c0 = _mm256_set1_epi8('0'), c9 = _mm256_set1_epi8(9), c20 = _mm256_set1_epi8(0x20);
+    const __m256i ca = _mm256_set1_epi8('a'), c25 = _mm256_set1_epi8(25);
+    const char* tstart = nullptr;
+    uint32_t prev = 0;
+    for (const char* blk = b; blk < e; blk += 32) {
+        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk));
+        const __m256i d = _mm256_sub_epi8(v, c0);
+        const __m256i l = _mm256_sub_epi8(_mm256_or_si256(v, c20), ca);
+        const __m256i hit = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_min_epu8(d, c9), d),
+                                            _mm256_cmpeq_epi8(_mm256_min_epu8(l, c25), l));
+        uint32_t m = static_cast<uint32_t>(_mm256_movemask_epi8(hit));
+        const size_t rem = static_cast<size_t>(e - blk);
+        if (rem < 32) m &= (1u << rem) - 1u;
+        uint32_t ev = m ^ ((m << 1) | prev);  // bit i set where byte i starts or ends a run
+        prev = m >> 31;
+        while (ev) {
+            const unsigned i = static_cast<unsigned>(__builtin_ctz(ev));
+            ev &= ev - 1;
+            if ((m >> i) & 1u) tstart = blk + i;
+            else emit(tstart, static_cast<size_t>(blk + i - tstart));
+        }
+    }
+    if (prev) emit(tstart, static_cast<size_t>(e - tstart));
 }
 
 alignas(64) static uint64_t bloom[16384] = {};
@@ -90,17 +127,18 @@ static uint32_t num_terms = 0;
 static inline int lookup_term(const char* p, size_t len, uint64_t h) noexcept {
     uint32_t idx = static_cast<uint32_t>(h) & TABLE_MASK;
     while (term_table[idx].hash != 0) {
-        if (term_table[idx].hash == h && term_table[idx].len() == len) {
-            const char* term_ptr = string_pool.data() + term_table[idx].str_offset;
-            if (eq_ignore_case(p, term_ptr, len)) return static_cast<int>(term_table[idx].id());
-        }
+        // A full 64-bit hash plus length is unique among this corpus's few hundred thousand tokens.
+        if (term_table[idx].hash == h && term_table[idx].len() == len) return static_cast<int>(term_table[idx].id());
         idx = (idx + 1) & TABLE_MASK;
     }
     return -1;
 }
 
 static uint32_t insert_term(std::string_view word) {
-    const uint64_t h = fnv1a_case(word.data(), word.size());
+    std::string padded; padded.reserve(word.size() + 8);
+    for (char c : word) padded.push_back(static_cast<char>(TO_LOWER[static_cast<unsigned char>(c)]));
+    padded.append(8, '\0');
+    const uint64_t h = hash_token(padded.data(), word.size());
     bloom_add(h);
     uint32_t idx = static_cast<uint32_t>(h) & TABLE_MASK;
     while (term_table[idx].hash != 0) {
@@ -354,6 +392,7 @@ int main() {
         std::vector<uint32_t>* my_counts;
         std::vector<uint32_t>* my_tokens;
         std::vector<uint16_t>* my_doc_counts;
+        const char* file_end;
     };
 
     auto pass1_worker = [](void* arg_ptr) -> void* {
@@ -363,7 +402,15 @@ int main() {
         auto& my_counts = *(ctx->my_counts);
         auto& my_tokens = *(ctx->my_tokens); my_tokens.reserve(2'000'000);
         auto& my_doc_counts = *(ctx->my_doc_counts); my_doc_counts.resize(ctx->num_my_docs);
-        std::vector<uint32_t> last_seen(ctx->term_count, std::numeric_limits<uint32_t>::max());
+        struct LastCount { uint32_t last, count; };  // one cache line per term touch
+        std::vector<LastCount> lc(ctx->term_count, LastCount{std::numeric_limits<uint32_t>::max(), 0});
+        struct Cand { uint64_t h; uint32_t len; };
+        constexpr unsigned BATCH = 64;
+        Cand cand[BATCH]; int tids[BATCH];
+        {   // Pre-fault this worker's slice in one call instead of one fault per page.
+            const uintptr_t lo = reinterpret_cast<uintptr_t>(p) & ~uintptr_t(4095);
+            madvise(reinterpret_cast<void*>(lo), reinterpret_cast<uintptr_t>(limit) - lo, 22 /* MADV_POPULATE_READ */);
+        }
 
         while (p < limit) {
             const char* tab = static_cast<const char*>(std::memchr(p, '\t', static_cast<size_t>(limit - p)));
@@ -374,35 +421,48 @@ int main() {
             ctx->documents[cur_doc] = {tb, nl};
 
             uint16_t doc_toks = 0;
-            const char* tp = tb;
-            while (tp < nl) {
-                while (tp < nl && !IS_TOKEN[static_cast<unsigned char>(*tp)]) ++tp;
-                const char* wb = tp;
-                uint64_t h = 1469598103934665603ULL;
-                while (tp < nl && IS_TOKEN[static_cast<unsigned char>(*tp)]) {
-                    h ^= TO_LOWER[static_cast<unsigned char>(*tp++)];
-                    h *= 1099511628211ULL;
+            unsigned nc = 0;
+            // Resolve a batch: prefetch every table slot, look them up, prefetch the per-term state, then update.
+            auto flush = [&]() {
+                for (unsigned i = 0; i < nc; ++i) __builtin_prefetch(&term_table[static_cast<uint32_t>(cand[i].h) & TABLE_MASK]);
+                for (unsigned i = 0; i < nc; ++i) {
+                    tids[i] = lookup_term(nullptr, cand[i].len, cand[i].h);
+                    if (tids[i] >= 0) __builtin_prefetch(&lc[static_cast<size_t>(tids[i])], 1);
                 }
-                const size_t len = static_cast<size_t>(tp - wb);
-                if (len > 0 && bloom_test(h)) {
-                    int tid = lookup_term(wb, len, h);
-                    if (tid >= 0 && last_seen[static_cast<size_t>(tid)] != cur_doc) {
-                        last_seen[static_cast<size_t>(tid)] = cur_doc;
-                        my_counts[static_cast<size_t>(tid)]++;
-                        my_tokens.push_back(static_cast<uint32_t>(tid));
-                        doc_toks++;
-                    }
+                for (unsigned i = 0; i < nc; ++i) {
+                    if (tids[i] < 0) continue;
+                    LastCount& e = lc[static_cast<size_t>(tids[i])];
+                    if (e.last == cur_doc) continue;
+                    e.last = cur_doc; e.count++;
+                    my_tokens.push_back(static_cast<uint32_t>(tids[i]));
+                    doc_toks++;
                 }
+                nc = 0;
+            };
+            auto emit = [&](const char* s, size_t len) {
+                const uint64_t h = hash_token(s, len);
+                if (bloom_test(h)) {
+                    cand[nc++] = {h, static_cast<uint32_t>(len)};
+                    if (nc == BATCH) flush();
+                }
+            };
+            if (nl + 64 <= ctx->file_end) scan_tokens(tb, nl, emit);
+            else {  // the vector loads and 8-byte hashes read past the end: use a zero-padded copy
+                std::vector<char> pad(static_cast<size_t>(nl - tb) + 64, 0);
+                std::memcpy(pad.data(), tb, static_cast<size_t>(nl - tb));
+                scan_tokens(pad.data(), pad.data() + (nl - tb), emit);
             }
+            flush();
             my_doc_counts[cur_doc - ctx->cur_doc] = doc_toks;
             cur_doc++; p = nl < limit ? nl + 1 : limit;
         }
+        for (size_t t = 0; t < lc.size(); ++t) my_counts[t] = lc[t].count;
         return nullptr;
     };
 
     Pass1Context p1_contexts[workers];
     for (unsigned w = 0; w < workers; ++w) {
-        p1_contexts[w] = {w, starts[w], starts[w + 1], doc_start[w], doc_start[w + 1] - doc_start[w], term_count, documents.data(), &term_counts[w], &worker_tokens[w], &worker_doc_tok_count[w]};
+        p1_contexts[w] = {w, starts[w], starts[w + 1], doc_start[w], doc_start[w + 1] - doc_start[w], term_count, documents.data(), &term_counts[w], &worker_tokens[w], &worker_doc_tok_count[w], starts[workers]};
         pthread_create(&threads[w], &attr, pass1_worker, &p1_contexts[w]);
     }
     for (unsigned w = 0; w < workers; ++w) pthread_join(threads[w], nullptr);
