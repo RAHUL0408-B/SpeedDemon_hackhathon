@@ -179,6 +179,46 @@ int main() {
         const char* cur = split_points[w], *lim = split_points[w + 1];
         auto& aggs = partial[w];
         std::string scratch;
+
+        // Records are parsed into a small batch first. The random accesses (region lookup, name table, country
+        // bitmap) are prefetched while the batch fills and again while it drains, so their latency overlaps.
+        struct Rec { uint64_t hash; int64_t amount; uint32_t id, region, name_len, note_len; uint32_t group, slot; };
+        constexpr unsigned BATCH = 32;
+        Rec batch[BATCH];
+        unsigned nb = 0;
+
+        auto drain = [&]() {
+            for (unsigned i = 0; i < nb; ++i) {
+                Rec& r = batch[i];
+                const uint16_t mapped = (r.region < region_to_country.size()) ? region_to_country[r.region] : 0;
+                r.group = mapped ? static_cast<uint32_t>(mapped - 1) : unmatched_cid;
+                uint32_t slot = static_cast<uint32_t>(r.hash) & (NAME_SLOTS - 1);
+                for (;;) {
+                    uint64_t key = name_table[slot].load(std::memory_order_relaxed);
+                    if (key == 0 && name_table[slot].compare_exchange_strong(key, r.hash, std::memory_order_relaxed)) break;
+                    if (key == r.hash) break;
+                    slot = (slot + 1) & (NAME_SLOTS - 1);
+                }
+                r.slot = slot;
+                __builtin_prefetch(&seen[static_cast<size_t>(r.group) * ROW_WORDS + (slot >> 6)], 1);
+            }
+            for (unsigned i = 0; i < nb; ++i) {
+                const Rec& r = batch[i];
+                WorkerCountryAgg& agg = aggs[r.group];
+                if (!agg.count) { agg.minimum = agg.maximum = r.amount; }
+                else {
+                    if (r.amount < agg.minimum) agg.minimum = r.amount;
+                    if (r.amount > agg.maximum) agg.maximum = r.amount;
+                }
+                ++agg.count; agg.id_sum += r.id; agg.amount_sum += r.amount;
+                agg.name_bytes += r.name_len; agg.note_bytes += r.note_len;
+                const uint64_t bit = 1ULL << (r.slot & 63);
+                std::atomic<uint64_t>& word = seen[static_cast<size_t>(r.group) * ROW_WORDS + (r.slot >> 6)];
+                if (!(word.load(std::memory_order_relaxed) & bit)) word.fetch_or(bit, std::memory_order_relaxed);
+            }
+            nb = 0;
+        };
+
         while (cur < lim) {
             if (lim - cur >= 3 && static_cast<unsigned char>(cur[0]) == 0xef && static_cast<unsigned char>(cur[1]) == 0xbb && static_cast<unsigned char>(cur[2]) == 0xbf) cur += 3;
             const uint32_t rec_id = read_uint32(cur);
@@ -193,32 +233,15 @@ int main() {
             if (cur < lim && *cur == '\r') ++cur;
             if (cur < lim && *cur == '\n') ++cur;
 
-            const uint16_t mapped = (region < region_to_country.size()) ? region_to_country[region] : 0;
-            const size_t group = mapped ? static_cast<size_t>(mapped - 1) : unmatched_cid;
-
-            WorkerCountryAgg& agg = aggs[group];
-            if (!agg.count) { agg.minimum = agg.maximum = amount; }
-            else {
-                if (amount < agg.minimum) agg.minimum = amount;
-                if (amount > agg.maximum) agg.maximum = amount;
-            }
-            ++agg.count; agg.id_sum += rec_id; agg.amount_sum += amount;
             auto [h, n] = name_hash_and_len(name, scratch);
-            agg.name_bytes += n;
             if (!h) h = 1;
-            uint32_t slot = static_cast<uint32_t>(h) & (NAME_SLOTS - 1);
-            for (;;) {
-                uint64_t key = name_table[slot].load(std::memory_order_relaxed);
-                if (key == 0 && name_table[slot].compare_exchange_strong(key, h, std::memory_order_relaxed)) break;
-                if (key == h) break;
-                slot = (slot + 1) & (NAME_SLOTS - 1);
-            }
-            const uint64_t bit = 1ULL << (slot & 63);
-            std::atomic<uint64_t>& word = seen[group * ROW_WORDS + (slot >> 6)];
-            if (!(word.load(std::memory_order_relaxed) & bit)) word.fetch_or(bit, std::memory_order_relaxed);
-
-            agg.note_bytes += static_cast<uint64_t>(note.end - note.begin) - note.pairs;
+            __builtin_prefetch(&name_table[static_cast<uint32_t>(h) & (NAME_SLOTS - 1)], 1);
+            if (region < region_to_country.size()) __builtin_prefetch(&region_to_country[region]);
+            batch[nb++] = {h, amount, rec_id, region, static_cast<uint32_t>(n),
+                           static_cast<uint32_t>(static_cast<uint64_t>(note.end - note.begin) - note.pairs), 0, 0};
+            if (nb == BATCH) drain();
         }
+        drain();
     };
 
     std::vector<std::thread> pool; pool.reserve(WORKERS);
