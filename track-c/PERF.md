@@ -33,3 +33,7 @@ Output sha256 d8088b1c...f536 at every step (full dataset, seed 1).
 1. **Distinct names per country.** A shared open-addressing table maps each name's 64-bit hash to a slot, and every country owns one bit per slot, so a country's distinct count is a popcount of its row. This removed the per-worker sorts and the merge.
 2. **Parsing.** Quoted fields are scanned with `memchr` for the next quote (`""` pairs counted, not copied), and names are hashed eight bytes at a time over the unescaped value. A page-touch test showed memory was not the limit; cache-miss latency was.
 3. **Batching.** Records are parsed into a 32-entry batch while the random accesses (region lookup, name table, bitmap word) are prefetched, then drained.
+
+## v6: parsing details and exit (local Docker; board run ID pending)
+
+SWAR digit parsing (one mask finds the end of a number), an inline AVX2 quote search, and two zero pages after the mapped file so the wide reads at the end of the file stay in bounds. Gains were within noise (~4%). `_exit(0)` after the output skips the destructors. Hash unchanged.

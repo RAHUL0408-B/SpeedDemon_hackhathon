@@ -331,5 +331,5 @@ int main() {
         obuf += written; rem -= static_cast<size_t>(written);
     }
     close(out_fd);
-    return 0;
+    _exit(0);  // the answer is on disk; skip the destructors and their frees
 }

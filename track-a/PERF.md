@@ -31,3 +31,15 @@
 2. **Line parse.** The timestamp has a fixed width. The method and endpoint ends are found with a 32-byte compare and `ctz`, the endpoint is hashed eight bytes at a time into a 4096-slot table (hash, length and `memcmp` are all checked), and the latency is read as it is reached, so there is no per-line `memchr`.
 3. **Merge.** Each worker buckets `(endpoint id, 5xx flag, latency)` by hour. Threads then take one hour at a time, count per endpoint, scatter latencies into one buffer and select the percentiles. Endpoint order is sorted once, not per hour.
 4. Failed idea kept for the record: v3's modulo histogram allocated 4.4 GB.
+
+## v6: memory and exit (local Docker; board run ID pending)
+
+Measured with the container's cgroup `memory.peak`, which matched the board's MEM column (A 51 vs 53, C 15 vs 15).
+
+| Step | Peak memory | Wall time |
+|------|-------------|-----------|
+| v5 | 51 MB | ~58 ms median |
+| 6-byte records (latency u32 + key u16), hours written in order while the merge still runs | 41 MB (10 MB of it is the output file) | ~53 ms median |
+| `_exit(0)` after the output is written | 41 MB | ~55-60 ms median (was 62-79 in interleaved runs) |
+
+Hashes unchanged on the full, shuffled-full and sample inputs.

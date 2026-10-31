@@ -35,3 +35,9 @@ Profile of v4 on the full dataset (250k docs, 50k queries): parse queries 42 ms,
 2. **Phrase queries** were 80% of query time. The verifier now finds the anchor word with a two-byte SIMD search and runs the exact neighbour checks only at hits.
 3. **Common terms.** 714 terms hold 54% of the postings. The first 800 documents give a document-frequency sample; the 1,202 terms seen in at least 8 of them get a bitmap row that the scan sets directly through a small cache-resident table. They never enter the postings lists. A wrong guess only costs speed. Result sums over a bitmap use six weighted popcounts per word instead of visiting each bit.
 4. Tried and dropped: `MADV_POPULATE_READ` on the docs mapping (no gain).
+
+## v6: where the time and memory go (local Docker; board run ID pending)
+
+- Memory by phase (cgroup): 14 MB after parsing queries, 94 MB after the scan (38 MB bitmaps, ~38 MB token lists), 132 MB peak in the scatter, 100 MB once the token lists are freed. The token lists plus the postings array are inherent to the counting-sort design, so the floor here is about 100 MB.
+- Cycle counters in the scan showed ~100 cycles per table lookup and ~45% of the time outside lookups. A per-thread token cache (42% hit rate at 2K entries) and a single-lookup flush were neutral locally. Cache sizes of 16K and 64K entries were slower. The scan is bounded by shared-memory contention across 12 threads, not per-token compute.
+- Exit: the two big arrays (postings and bitmaps, ~80 MB) are now released with `madvise(MADV_DONTNEED)` from all 12 threads after the answer is written, then `_exit(0)`. Median wall time dropped by about 22 ms in two interleaved comparisons.

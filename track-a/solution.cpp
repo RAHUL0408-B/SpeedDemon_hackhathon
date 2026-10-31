@@ -311,5 +311,5 @@ int main() {
         }
     });
     close(out_fd);
-    return 0;
+    _exit(0);  // the answer is on disk; skip the destructors and their frees
 }

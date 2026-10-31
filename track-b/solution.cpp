@@ -793,7 +793,6 @@ int main() {
         pthread_create(&threads[w], &attr, query_worker, &q_contexts[w]);
     }
     for (unsigned w = 0; w < workers; ++w) pthread_join(threads[w], nullptr);
-    pthread_attr_destroy(&attr);
 
     const int out_fd = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) _exit(2);
@@ -806,5 +805,23 @@ int main() {
         }
     }
     close(out_fd);
-    return 0;
+
+    // The answer is on disk. Hand the two big arrays back from every thread at once, then skip the destructors:
+    // otherwise the kernel frees ~80 MB page by page on this thread while the process exits.
+    struct Region { char* base; size_t bytes; };
+    static Region regions[2];
+    regions[0] = {reinterpret_cast<char*>(flat_postings.get()), static_cast<size_t>(term_offsets[term_count]) * sizeof(uint32_t)};
+    regions[1] = {reinterpret_cast<char*>(dense_bits), (dense_terms.size() * bitmap_words + 1) * sizeof(uint64_t)};
+    auto release_worker = [](void* arg) -> void* {
+        const uintptr_t w = reinterpret_cast<uintptr_t>(arg);
+        for (const Region& r : regions) {
+            const uintptr_t lo = (reinterpret_cast<uintptr_t>(r.base) + r.bytes * w / workers + 4095) & ~uintptr_t(4095);
+            const uintptr_t hi = (reinterpret_cast<uintptr_t>(r.base) + r.bytes * (w + 1) / workers) & ~uintptr_t(4095);
+            if (hi > lo) madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_DONTNEED);
+        }
+        return nullptr;
+    };
+    for (unsigned w = 0; w < workers; ++w) pthread_create(&threads[w], &attr, release_worker, reinterpret_cast<void*>(static_cast<uintptr_t>(w)));
+    for (unsigned w = 0; w < workers; ++w) pthread_join(threads[w], nullptr);
+    _exit(0);
 }
