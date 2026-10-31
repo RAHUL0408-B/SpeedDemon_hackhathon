@@ -218,6 +218,29 @@ static inline bool phrase_anchored(const char* doc_start, const char* doc_end, c
 
 static inline void set_and(const std::vector<uint32_t>& a, const uint32_t* b, size_t b_len, std::vector<uint32_t>& out) {
     const size_t a_len = a.size();
+    // Phrase anchors are usually U/R terms.  Do not linearly walk a huge
+    // VC/C posting list just to filter a few hundred anchor candidates.
+    if (b_len > a_len * 8) {
+        out.clear(); out.reserve(a_len);
+        size_t lo = 0;
+        for (uint32_t id : a) {
+            const uint32_t* it = std::lower_bound(b + lo, b + b_len, id);
+            lo = static_cast<size_t>(it - b);
+            if (it != b + b_len && *it == id) out.push_back(id);
+        }
+        return;
+    }
+    if (a_len > b_len * 8) {
+        out.clear(); out.reserve(b_len);
+        size_t lo = 0;
+        for (size_t j = 0; j < b_len; ++j) {
+            const uint32_t id = b[j];
+            const auto it = std::lower_bound(a.begin() + static_cast<std::ptrdiff_t>(lo), a.end(), id);
+            lo = static_cast<size_t>(it - a.begin());
+            if (it != a.end() && *it == id) out.push_back(id);
+        }
+        return;
+    }
     out.resize(std::min(a_len, b_len));
     uint32_t* dst = out.data();
     size_t i = 0, j = 0, cnt = 0;
