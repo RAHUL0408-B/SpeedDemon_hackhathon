@@ -195,6 +195,10 @@ int main() {
                 agg.note_bytes += nb;
             }
         }
+        // Each worker owns these vectors. Sorting them here turns one large,
+        // serial country sort during reduction into twelve smaller parallel
+        // sorts, and lets the reduction count a sorted multiway union.
+        for (auto& country_hashes : hashes) std::sort(country_hashes.begin(), country_hashes.end());
     };
 
     std::vector<std::thread> pool; pool.reserve(WORKERS);
@@ -229,10 +233,33 @@ int main() {
             res.name_bytes += src.name_bytes; res.note_bytes += src.note_bytes;
         }
 
-        std::vector<uint64_t> all_h; all_h.reserve(total_hashes_len);
-        for (unsigned w = 0; w < WORKERS; ++w) all_h.insert(all_h.end(), worker_hashes[w][c].begin(), worker_hashes[w][c].end());
-        std::sort(all_h.begin(), all_h.end());
-        res.distinct_names = static_cast<size_t>(std::unique(all_h.begin(), all_h.end()) - all_h.begin());
+        // Count the union of the already sorted worker partitions.  At most
+        // twelve heads are inspected per distinct hash; this avoids copying
+        // and sorting the full country vector again.
+        size_t pos[WORKERS]{};
+        uint64_t previous = 0;
+        bool have_previous = false;
+        for (;;) {
+            uint64_t next = std::numeric_limits<uint64_t>::max();
+            bool have_next = false;
+            for (unsigned w = 0; w < WORKERS; ++w) {
+                const auto& src = worker_hashes[w][c];
+                if (pos[w] < src.size() && (!have_next || src[pos[w]] < next)) {
+                    next = src[pos[w]];
+                    have_next = true;
+                }
+            }
+            if (!have_next) break;
+            if (!have_previous || next != previous) {
+                ++res.distinct_names;
+                previous = next;
+                have_previous = true;
+            }
+            for (unsigned w = 0; w < WORKERS; ++w) {
+                const auto& src = worker_hashes[w][c];
+                while (pos[w] < src.size() && src[pos[w]] == next) ++pos[w];
+            }
+        }
     };
 
     for (unsigned i = 0; i < WORKERS; ++i) {
