@@ -125,19 +125,7 @@ struct TableEntry {
 static TableEntry term_table[TABLE_CAP];
 static std::string string_pool;
 static uint32_t num_terms = 0;
-static std::vector<uint64_t> term_hash;    // by term id, for building the common-term table
-static std::vector<uint32_t> term_length;
-
-// The common terms, probed before the full table: a tiny table that stays in cache.
-static constexpr uint32_t DENSE_CAP = 8192;
-struct DenseEntry { uint64_t hash = 0; uint32_t row = 0, len = 0; };
-static DenseEntry dense_table[DENSE_CAP];
-
-static inline int dense_row(uint64_t h, size_t len) noexcept {
-    for (uint32_t slot = static_cast<uint32_t>(h) & (DENSE_CAP - 1); dense_table[slot].hash; slot = (slot + 1) & (DENSE_CAP - 1))
-        if (dense_table[slot].hash == h && dense_table[slot].len == len) return static_cast<int>(dense_table[slot].row);
-    return -1;
-}
+static constexpr uint32_t MAX_DENSE_TERMS = 4096;  // bitmap rows: the very common terms
 
 static inline int lookup_term(const char* p, size_t len, uint64_t h) noexcept {
     uint32_t idx = static_cast<uint32_t>(h) & TABLE_MASK;
@@ -167,7 +155,6 @@ static uint32_t insert_term(std::string_view word) {
         idx = (idx + 1) & TABLE_MASK;
     }
     const uint32_t id = num_terms++;
-    term_hash.push_back(h); term_length.push_back(static_cast<uint32_t>(word.size()));
     term_table[idx].hash = h;
     term_table[idx].str_offset = static_cast<uint32_t>(string_pool.size());
     term_table[idx].len_and_id = (static_cast<uint32_t>(word.size()) << 24) | id;
@@ -415,11 +402,8 @@ int main() {
             p = nl + 1;
         }
         for (uint32_t t = 0; t < term_count; ++t) {
-            if (df[t] < MIN_DF || dense_terms.size() >= DENSE_CAP / 2) continue;
+            if (df[t] < MIN_DF || dense_terms.size() >= MAX_DENSE_TERMS) continue;
             dense_index[t] = static_cast<int32_t>(dense_terms.size());
-            uint32_t slot = static_cast<uint32_t>(term_hash[t]) & (DENSE_CAP - 1);
-            while (dense_table[slot].hash) slot = (slot + 1) & (DENSE_CAP - 1);
-            dense_table[slot] = {term_hash[t], static_cast<uint32_t>(dense_terms.size()), term_length[t]};
             dense_terms.push_back(t);
         }
     }
@@ -447,6 +431,7 @@ int main() {
         std::vector<uint32_t>* my_tokens;
         std::vector<uint16_t>* my_doc_counts;
         const char* file_end;
+        const int32_t* dense_index;  // term id -> bitmap row, or -1
         uint64_t* dense_bits;
         uint32_t bitmap_words, first_word, last_word;  // last_word: the worker's last bitmap word, shared with its neighbour
     };
@@ -463,6 +448,11 @@ int main() {
         struct Cand { uint64_t h; uint32_t len; };
         constexpr unsigned BATCH = 64;
         Cand cand[BATCH]; int tids[BATCH], rows[BATCH];
+        // Words repeat constantly, so a small per-thread cache from token hash to (term id, bitmap row) answers most
+        // tokens in one L1 hit. A negative answer (not a query term) is cached too.
+        struct Memo { uint64_t hash; int32_t tid, row; };
+        constexpr uint32_t MEMO_SIZE = 2048;
+        std::vector<Memo> memo(MEMO_SIZE, Memo{0, -1, -1});
         {   // Pre-fault this worker's slice in one call instead of one fault per page.
             const uintptr_t lo = reinterpret_cast<uintptr_t>(p) & ~uintptr_t(4095);
             madvise(reinterpret_cast<void*>(lo), reinterpret_cast<uintptr_t>(limit) - lo, 22 /* MADV_POPULATE_READ */);
@@ -478,40 +468,45 @@ int main() {
 
             uint16_t doc_toks = 0;
             unsigned nc = 0;
-            // Resolve a batch in stages so the cache misses overlap: probe the common-term table and prefetch the
-            // bitmap word or the full-table slot, then do the writes and lookups, then update the per-term state.
+            // Resolve a batch in stages so the cache misses overlap: prefetch the table slots, look the terms up and
+            // prefetch what each one touches (a bitmap word for a common term, the per-term state otherwise), then apply.
+            const uint32_t word_index = cur_doc >> 6;
+            const uint64_t bit = 1ULL << (cur_doc & 63);
+            // Record that the current document contains term tid (row >= 0: a common term kept in a bitmap).
+            auto record = [&](int tid, int row) {
+                if (row >= 0) {  // set its bit; only the edge words are shared with a neighbouring worker
+                    uint64_t* word = &ctx->dense_bits[static_cast<size_t>(row) * ctx->bitmap_words + word_index];
+                    if (word_index == ctx->first_word || word_index == ctx->last_word) __atomic_fetch_or(word, bit, __ATOMIC_RELAXED);
+                    else *word |= bit;
+                    return;
+                }
+                LastCount& e = lc[static_cast<size_t>(tid)];
+                if (e.last == cur_doc) return;
+                e.last = cur_doc; e.count++;
+                my_tokens.push_back(static_cast<uint32_t>(tid));
+                doc_toks++;
+            };
+            // Resolve a batch of cache misses in stages so the memory latency overlaps: prefetch the table slots,
+            // look the terms up, then record them and remember the answers.
             auto flush = [&]() {
+                for (unsigned i = 0; i < nc; ++i) __builtin_prefetch(&term_table[static_cast<uint32_t>(cand[i].h) & TABLE_MASK]);
                 for (unsigned i = 0; i < nc; ++i) {
-                    rows[i] = dense_row(cand[i].h, cand[i].len);
-                    if (rows[i] >= 0) __builtin_prefetch(&ctx->dense_bits[static_cast<size_t>(rows[i]) * ctx->bitmap_words + (cur_doc >> 6)], 1);
-                    else __builtin_prefetch(&term_table[static_cast<uint32_t>(cand[i].h) & TABLE_MASK]);
-                }
-                const uint32_t word_index = cur_doc >> 6;
-                const uint64_t bit = 1ULL << (cur_doc & 63);
-                for (unsigned i = 0; i < nc; ++i) {
-                    if (rows[i] >= 0) {  // a common term: set its bit; only the edge words are shared with a neighbour
-                        uint64_t* word = &ctx->dense_bits[static_cast<size_t>(rows[i]) * ctx->bitmap_words + word_index];
-                        if (word_index == ctx->first_word || word_index == ctx->last_word) __atomic_fetch_or(word, bit, __ATOMIC_RELAXED);
-                        else *word |= bit;
-                        tids[i] = -1;
-                        continue;
-                    }
                     tids[i] = lookup_term(nullptr, cand[i].len, cand[i].h);
-                    if (tids[i] >= 0) __builtin_prefetch(&lc[static_cast<size_t>(tids[i])], 1);
+                    rows[i] = tids[i] >= 0 ? ctx->dense_index[tids[i]] : -1;
+                    if (rows[i] >= 0) __builtin_prefetch(&ctx->dense_bits[static_cast<size_t>(rows[i]) * ctx->bitmap_words + word_index], 1);
+                    else if (tids[i] >= 0) __builtin_prefetch(&lc[static_cast<size_t>(tids[i])], 1);
                 }
                 for (unsigned i = 0; i < nc; ++i) {
-                    if (tids[i] < 0) continue;
-                    LastCount& e = lc[static_cast<size_t>(tids[i])];
-                    if (e.last == cur_doc) continue;
-                    e.last = cur_doc; e.count++;
-                    my_tokens.push_back(static_cast<uint32_t>(tids[i]));
-                    doc_toks++;
+                    memo[static_cast<uint32_t>(cand[i].h) & (MEMO_SIZE - 1)] = {cand[i].h, tids[i], rows[i]};
+                    if (tids[i] >= 0) record(tids[i], rows[i]);
                 }
                 nc = 0;
             };
             auto emit = [&](const char* s, size_t len) {
                 const uint64_t h = hash_token(s, len);
-                if (!bloom_test(h)) return;
+                Memo& m = memo[static_cast<uint32_t>(h) & (MEMO_SIZE - 1)];
+                if (m.hash == h) { if (m.tid >= 0) record(m.tid, m.row); return; }
+                if (!bloom_test(h)) { m = {h, -1, -1}; return; }
                 cand[nc++] = {h, static_cast<uint32_t>(len)};
                 if (nc == BATCH) flush();
             };
@@ -532,7 +527,7 @@ int main() {
     Pass1Context p1_contexts[workers];
     for (unsigned w = 0; w < workers; ++w) {
         p1_contexts[w] = {w, starts[w], starts[w + 1], doc_start[w], doc_start[w + 1] - doc_start[w], term_count, documents.data(), &term_counts[w], &worker_tokens[w], &worker_doc_tok_count[w], starts[workers],
-                         dense_bits, bitmap_words, doc_start[w] >> 6, (doc_start[w + 1] - 1) >> 6};
+                         dense_index.data(), dense_bits, bitmap_words, doc_start[w] >> 6, (doc_start[w + 1] - 1) >> 6};
         pthread_create(&threads[w], &attr, pass1_worker, &p1_contexts[w]);
     }
     for (unsigned w = 0; w < workers; ++w) pthread_join(threads[w], nullptr);
